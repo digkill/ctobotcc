@@ -1,4 +1,4 @@
-use axum::{routing::get, routing::post, Json, Router};
+use axum::{routing::{get, post}, Json, Router};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -6,14 +6,12 @@ use tracing::{error, info};
 use sqlx::{MySql, Pool, Row};
 use chrono::Utc;
 use anyhow::Result;
-
-// ======================= entry =======================
+use regex::Regex;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1) .env — из CWD
+    // env: пытаемся из CWD и из каталога проекта
     let _ = dotenvy::dotenv();
-    // 2) .env — рядом с Cargo.toml (если не нашли)
     if std::env::var("DATABASE_URL").is_err() {
         let manifest_env = format!("{}/.env", env!("CARGO_MANIFEST_DIR"));
         let _ = dotenvy::from_filename(&manifest_env);
@@ -22,17 +20,17 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").compact().init();
     println!("CWD: {}", std::env::current_dir()?.display());
 
-    // DB
+    // БД
     let db_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL not set (проверь .env или $env:DATABASE_URL)");
+        .expect("DATABASE_URL not set");
     let pool = Pool::<MySql>::connect(&db_url).await?;
     info!("Connected to MySQL");
 
-    // (Опционально) если используешь миграции sqlx::migrate! — раскомментируй:
+    // (по желанию) автопрогон миграций:
     // sqlx::migrate!("./migrations").run(&pool).await?;
     // info!("Migrations applied");
 
-    // Загрузка JSON-базы знаний в память
+    // JSON Q&A
     let kb = load_kb_json(
         &env::var("KNOWLEDGE_JSON").unwrap_or_else(|_| "knowledge.json".to_string())
     );
@@ -42,7 +40,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .with_state(AppState { pool, kb });
 
-    let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3000);
+    let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3011);
     let addr = std::net::SocketAddr::from(([0,0,0,0], port));
     info!("Listening on {addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
@@ -52,10 +50,10 @@ async fn main() -> Result<()> {
 #[derive(Clone)]
 struct AppState {
     pool: Pool<MySql>,
-    kb: KnowledgeBase, // in-memory JSON KB
+    kb: KnowledgeBase,
 }
 
-// ================= TamTam payloads ====================
+/* ===================== TamTam payloads ===================== */
 
 #[derive(Debug, Deserialize)]
 struct TamTamUpdate {
@@ -86,6 +84,8 @@ struct TamTamBody {
 struct TamTamRecipient {
     #[serde(default)]
     chat_id: Option<i64>,
+    #[serde(default)]
+    user_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -100,13 +100,18 @@ struct TamTamSender {
     user_id: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy)]
 enum TTRecipientKind { Chat(i64), User(i64) }
 
 fn pick_recipient(msg: &TamTamMessageWrapper) -> Option<TTRecipientKind> {
+    // приоритет: явный chat_id → явный user_id → sender.user_id
     if let Some(id) = msg.recipient.chat_id
         .or(msg.chat_id)
         .or(msg.chat.as_ref().and_then(|c| c.chat_id)) {
         return Some(TTRecipientKind::Chat(id));
+    }
+    if let Some(uid) = msg.recipient.user_id {
+        return Some(TTRecipientKind::User(uid));
     }
     if let Some(uid) = msg.sender.as_ref().and_then(|s| s.user_id) {
         return Some(TTRecipientKind::User(uid));
@@ -114,7 +119,7 @@ fn pick_recipient(msg: &TamTamMessageWrapper) -> Option<TTRecipientKind> {
     None
 }
 
-// ================= OpenAI types =======================
+/* ===================== OpenAI types ======================== */
 
 #[derive(Serialize)]
 struct OpenAIChatRequest {
@@ -139,7 +144,7 @@ struct OpenAIChoice {
     message: OpenAIMessage,
 }
 
-// ================= webhook ============================
+/* ====================== Webhook ============================ */
 
 async fn webhook(
     axum::extract::State(state): axum::extract::State<AppState>,
@@ -151,7 +156,8 @@ async fn webhook(
 
 async fn handle_update(state: AppState, update: TamTamUpdate) {
     let Some(msg) = update.message else { return; };
-    let text = msg.body.text.trim().to_string();
+    let raw_text = msg.body.text.clone();
+    let text = raw_text.trim().to_string();
     if text.is_empty() { return; }
 
     let Some(recipient) = pick_recipient(&msg) else {
@@ -159,43 +165,54 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
         return;
     };
 
-    // История/системный промпт
-    let history_max: i64 = env::var("HISTORY_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+    // ключ истории: чаты — chat_id, личка — -user_id
+    let hist_key = match recipient {
+        TTRecipientKind::Chat(id) => id,
+        TTRecipientKind::User(uid) => -uid,
+    };
+
     let system_prompt = env::var("SYSTEM_PROMPT")
         .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
+    let history_max: i64 = env::var("HISTORY_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
 
-    let mut messages = vec![ OpenAIMessage { role: "system".into(), content: system_prompt } ];
-
-    // История из БД (по chat_id для чатов / по user_id для лички — будем хранить раздельно)
-    let history_key = history_key_for(&recipient);
-    if let Ok(h) = load_history(&state.pool, history_key, history_max).await {
-        messages.extend(h);
+    // 0) Попытка ответить из Q&A (DB + JSON)
+    if let Some(answer) = try_answer_from_qa(&state, &text).await {
+        // Сохраним и ответим без OpenAI
+        let _ = save_history_batch(&state.pool, hist_key, &[
+            OpenAIMessage { role: "user".into(), content: text.clone() },
+            OpenAIMessage { role: "assistant".into(), content: answer.clone() },
+        ]).await;
+        let _ = send_tamtam(recipient, &answer).await;
+        return;
     }
 
-    // Вопрос пользователя
+    // 1) Сбор истории
+    let mut messages = vec![ OpenAIMessage { role: "system".into(), content: system_prompt } ];
+    if let Ok(h) = load_history(&state.pool, hist_key, history_max).await {
+        messages.extend(h);
+    }
     messages.push(OpenAIMessage { role: "user".into(), content: text.clone() });
 
-    // Факты из БД
-    if let Ok(facts) = load_facts(&state.pool, history_key).await {
+    // 2) Факты из БД
+    if let Ok(facts) = load_facts(&state.pool, hist_key).await {
         if !facts.is_empty() {
             let joined = facts.join("\n- ");
             messages.insert(1, OpenAIMessage {
                 role: "system".into(),
-                content: format!("Дополнительные факты из БД:\n- {}", joined),
+                content: format!("Дополнительные факты (БД):\n- {}", joined),
             });
         }
     }
 
-    // Факты из JSON KB
-    if !state.kb.items.is_empty() {
-        let joined = state.kb.items.join("\n- ");
+    // 3) Слабые совпадения из Q&A подмешиваем как контекст
+    if let Some(hints) = weak_hints_from_qa(&state, &text).await {
         messages.insert(1, OpenAIMessage {
             role: "system".into(),
-            content: format!("Дополнительные факты из knowledge.json:\n- {}", joined),
+            content: format!("Подсказки из Q&A:\n{}", hints),
         });
     }
 
-    // Вызов OpenAI
+    // 4) Модель
     let answer = match ask_openai(messages.clone()).await {
         Ok(a) if !a.trim().is_empty() => a,
         Ok(_) => "…".to_string(),
@@ -205,28 +222,19 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
         }
     };
 
-    // Сохраняем историю
-    if let Err(e) = save_history_batch(&state.pool, history_key, &[
+    // 5) Сохраняем и отправляем
+    if let Err(e) = save_history_batch(&state.pool, hist_key, &[
         OpenAIMessage { role: "user".into(), content: text },
         OpenAIMessage { role: "assistant".into(), content: answer.clone() },
     ]).await {
         error!("save_history_batch error: {e:?}");
     }
-
-    // Отправляем ответ
     if let Err(e) = send_tamtam(recipient, &answer).await {
         error!("send_tamtam error: {e:?}");
     }
 }
 
-// ================= DB helpers =========================
-
-fn history_key_for(r: &TTRecipientKind) -> i64 {
-    match *r {
-        TTRecipientKind::Chat(id) => id,
-        TTRecipientKind::User(uid) => -uid, // Лайфхак: лички храним как отрицательные ключи, чтобы не путать с chat_id
-    }
-}
+/* ====================== DB helpers ======================== */
 
 async fn load_history(pool: &Pool<MySql>, key: i64, limit: i64) -> Result<Vec<OpenAIMessage>> {
     let rows = sqlx::query(
@@ -287,7 +295,145 @@ async fn load_facts(pool: &Pool<MySql>, key: i64) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|row| row.try_get::<String, _>("content").unwrap_or_default()).collect())
 }
 
-// ================= TamTam send ========================
+/* ================== Q&A knowledge (DB + JSON) ============= */
+
+#[derive(Clone, Default)]
+struct KnowledgeBase {
+    // плоский JSON Q&A
+    qa: Vec<QaPair>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct QaPair {
+    q: String,
+    a: String,
+    #[serde(default)]
+    tags: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KnowledgeJson {
+    #[serde(default)]
+    faq: Vec<QaPair>,
+}
+
+fn normalize(s: &str) -> String {
+    let s = s.to_lowercase();
+    let re = Regex::new(r"[^\p{L}\p{Nd}\s]").unwrap(); // только буквы/цифры/пробел
+    re.replace_all(&s, " ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn jw(a: &str, b: &str) -> f64 {
+    strsim::jaro_winkler(a, b) as f64
+}
+
+fn token_overlap(a: &str, b: &str) -> f64 {
+    let set_a: std::collections::HashSet<_> = a.split_whitespace().collect();
+    let set_b: std::collections::HashSet<_> = b.split_whitespace().collect();
+    let inter = set_a.intersection(&set_b).count() as f64;
+    let union = set_a.union(&set_b).count() as f64;
+    if union == 0.0 { 0.0 } else { inter / union }
+}
+
+fn score(q: &str, cand: &str) -> f64 {
+    // гибрид: Jaro–Winkler + Jaccard по токенам
+    let n_q = normalize(q);
+    let n_c = normalize(cand);
+    0.65 * jw(&n_q, &n_c) + 0.35 * token_overlap(&n_q, &n_c)
+}
+
+fn load_kb_json(path: &str) -> KnowledgeBase {
+    match std::fs::read_to_string(path) {
+        Ok(s) => match serde_json::from_str::<KnowledgeJson>(&s) {
+            Ok(k) => {
+                info!("Loaded knowledge.json: {} facts", k.faq.len());
+                KnowledgeBase { qa: k.faq }
+            }
+            Err(e) => { error!("knowledge.json parse error: {e:?}"); KnowledgeBase::default() }
+        },
+        Err(e) => { info!("knowledge.json not found ({}): {}", path, e); KnowledgeBase::default() }
+    }
+}
+
+async fn try_answer_from_qa(state: &AppState, query: &str) -> Option<String> {
+    // 1) DB Q&A
+    let mut best: Option<(f64, String)> = None;
+
+    if let Ok(rows) = sqlx::query("SELECT question, answer FROM qa_pairs ORDER BY id DESC LIMIT 200")
+        .fetch_all(&state.pool).await
+    {
+        for row in rows {
+            let q: String = row.try_get("question").unwrap_or_default();
+            let a: String = row.try_get("answer").unwrap_or_default();
+            let s = score(query, &q);
+            if s >= 0.88 {
+                return Some(a); // уверенное совпадение — отдаём сразу
+            }
+            if s >= 0.70 {
+                if let Some((best_s, _)) = best.as_ref() {
+                    if s > *best_s { best = Some((s, a)); }
+                } else { best = Some((s, a)); }
+            }
+        }
+    }
+
+    // 2) JSON Q&A
+    for pair in &state.kb.qa {
+        let s = score(query, &pair.q);
+        if s >= 0.88 {
+            return Some(pair.a.clone());
+        }
+        if s >= 0.70 {
+            if let Some((best_s, _)) = best.as_ref() {
+                if s > *best_s { best = Some((s, pair.a.clone())); }
+            } else { best = Some((s, pair.a.clone())); }
+        }
+    }
+
+    // если лучший кандидат очень хороший (>=0.82) — можно тоже вернуть сразу
+    if let Some((s, a)) = best {
+        if s >= 0.82 { return Some(a); }
+    }
+
+    None
+}
+
+async fn weak_hints_from_qa(state: &AppState, query: &str) -> Option<String> {
+    // вернём 1–3 намёка средней уверенности, чтобы помочь LLM
+    let mut candidates: Vec<(f64, String, String)> = Vec::new();
+
+    if let Ok(rows) = sqlx::query("SELECT question, answer FROM qa_pairs ORDER BY id DESC LIMIT 200")
+        .fetch_all(&state.pool).await
+    {
+        for row in rows {
+            let q: String = row.try_get("question").unwrap_or_default();
+            let a: String = row.try_get("answer").unwrap_or_default();
+            let s = score(query, &q);
+            if s >= 0.60 && s < 0.88 {
+                candidates.push((s, q, a));
+            }
+        }
+    }
+
+    for pair in &state.kb.qa {
+        let s = score(query, &pair.q);
+        if s >= 0.60 && s < 0.88 {
+            candidates.push((s, pair.q.clone(), pair.a.clone()));
+        }
+    }
+
+    if candidates.is_empty() { return None; }
+
+    candidates.sort_by(|a,b| b.0.partial_cmp(&a.0).unwrap());
+    let take = std::cmp::min(3, candidates.len());
+    let mut out = String::new();
+    for (_, q, a) in candidates.into_iter().take(take) {
+        out.push_str(&format!("- Вопрос: {}\n  Ответ: {}\n", q, a));
+    }
+    Some(out)
+}
+
+/* ===================== TamTam send ========================= */
 
 use serde_json::json;
 
@@ -317,7 +463,7 @@ async fn send_tamtam(recipient: TTRecipientKind, text: &str) -> Result<()> {
     Ok(())
 }
 
-// ================= OpenAI call ========================
+/* ===================== OpenAI call ========================= */
 
 async fn ask_openai(messages: Vec<OpenAIMessage>) -> Result<String> {
     let api_key = env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
@@ -335,7 +481,7 @@ async fn ask_openai(messages: Vec<OpenAIMessage>) -> Result<String> {
 
     let status = res.status();
     if !status.is_success() {
-        let body = res.text().await.unwrap_or_default(); // text(self) потребляет res
+        let body = res.text().await.unwrap_or_default();
         anyhow::bail!("OpenAI HTTP {}: {}", status, body);
     }
 
@@ -345,38 +491,4 @@ async fn ask_openai(messages: Vec<OpenAIMessage>) -> Result<String> {
         .unwrap_or_else(|| "…".to_string());
 
     Ok(answer)
-}
-
-// ============== JSON knowledge base ===================
-
-#[derive(Clone, Default)]
-struct KnowledgeBase {
-    items: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct KnowledgeJson {
-    #[serde(default)]
-    facts: Vec<String>,
-}
-
-fn load_kb_json(path: &str) -> KnowledgeBase {
-    match std::fs::read_to_string(path) {
-        Ok(s) => {
-            match serde_json::from_str::<KnowledgeJson>(&s) {
-                Ok(k) => {
-                    info!("Loaded knowledge.json: {} facts", k.facts.len());
-                    KnowledgeBase { items: k.facts }
-                }
-                Err(e) => {
-                    error!("knowledge.json parse error: {e:?}");
-                    KnowledgeBase::default()
-                }
-            }
-        }
-        Err(e) => {
-            info!("knowledge.json not found ({}): {}", path, e);
-            KnowledgeBase::default()
-        }
-    }
 }
