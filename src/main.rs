@@ -4,7 +4,7 @@ use axum::{routing::{get, post}, Json, Router};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, Pool, Row};
+use sqlx::{mysql::MySqlRow, MySql, Pool, Row};
 use std::env;
 use tracing::{error, info};
 
@@ -1094,11 +1094,135 @@ async fn query_partner_payments(pool: &Pool<MySql>, _user_q: &str) -> Result<Str
     Ok(out)
 }
 
-async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
-    // В дампе нет явной таблицы loan_application — оставим совместимость на будущее
-    // Вернём заглушку.
-    let _ = user_q;
-    Ok("Таблица loan_application не найдена в текущей схеме. Уточни структуру — добавлю запрос.".into())
+pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
+    let q = user_q.trim();
+    if q.is_empty() {
+        return Ok("Укажи запрос: имя/телефон/email/номер заказа или id.".into());
+    }
+
+    // Если это чисто число — считаем, что хотят точный поиск по id.
+    let numeric_id = q.parse::<i64>().ok();
+
+    let rows: Vec<MySqlRow> = if let Some(id) = numeric_id {
+        sqlx::query(
+            r#"
+            SELECT
+              id, franchise_id, school_id,
+              first_name, last_name, middle_name,
+              client_phone, client_email,
+              order_id, tinkoff_order_id, link,
+              is_course, is_test,
+              status, amount,
+              DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS dt,
+              DATE_FORMAT(confirm_date, '%Y-%m-%d %H:%i') AS cdt
+            FROM loan_application
+            WHERE id = ?
+            ORDER BY created_at DESC
+            LIMIT 20
+            "#,
+        )
+            .bind(id)
+            .fetch_all(pool)
+            .await?
+    } else {
+        // Текстовый поиск по основным полям
+        sqlx::query(
+            r#"
+            SELECT
+              id, franchise_id, school_id,
+              first_name, last_name, middle_name,
+              client_phone, client_email,
+              order_id, tinkoff_order_id, link,
+              is_course, is_test,
+              status, amount,
+              DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS dt,
+              DATE_FORMAT(confirm_date, '%Y-%m-%d %H:%i') AS cdt
+            FROM loan_application
+            WHERE
+                first_name       LIKE CONCAT('%', ?, '%')
+             OR last_name        LIKE CONCAT('%', ?, '%')
+             OR middle_name      LIKE CONCAT('%', ?, '%')
+             OR client_phone     LIKE CONCAT('%', ?, '%')
+             OR client_email     LIKE CONCAT('%', ?, '%')
+             OR order_id         LIKE CONCAT('%', ?, '%')
+             OR tinkoff_order_id LIKE CONCAT('%', ?, '%')
+            ORDER BY created_at DESC
+            LIMIT 20
+            "#,
+        )
+            // Один и тот же паттерн биндится на все поля
+            .bind(q) // first_name
+            .bind(q) // last_name
+            .bind(q) // middle_name
+            .bind(q) // client_phone
+            .bind(q) // client_email
+            .bind(q) // order_id
+            .bind(q) // tinkoff_order_id
+            .fetch_all(pool)
+            .await?
+    };
+
+    if rows.is_empty() {
+        return Ok("Ничего не нашёл по запросу.".into());
+    }
+
+    let mut out = String::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let fid: Option<i64> = r.try_get("franchise_id").ok();
+        let sid: Option<i64> = r.try_get("school_id").ok();
+
+        let first_name: String = r.try_get("first_name").unwrap_or_default();
+        let last_name: String = r.try_get("last_name").unwrap_or_default();
+        let middle_name: String = r.try_get("middle_name").unwrap_or_default();
+
+        let phone: String = r.try_get("client_phone").unwrap_or_default();
+        let email: String = r.try_get("client_email").unwrap_or_default();
+
+        let order_id: String = r.try_get("order_id").unwrap_or_default();
+        let tinkoff_order_id: String = r.try_get("tinkoff_order_id").unwrap_or_default();
+        let link: String = r.try_get("link").unwrap_or_default();
+
+        let is_course: i64 = r.try_get("is_course").unwrap_or(0);
+        let is_test: i64 = r.try_get("is_test").unwrap_or(0);
+
+        let status: i64 = r.try_get("status").unwrap_or(0);
+        let amount: f64 = r.try_get("amount").unwrap_or(0.0);
+
+        let dt: String = r.try_get("dt").unwrap_or_default();
+        let cdt: String = r.try_get("cdt").unwrap_or_default();
+
+        let fio = [last_name.as_str(), first_name.as_str(), middle_name.as_str()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Строка-резюме по заявке
+        out.push_str(&format!(
+            "#{id} • {dt} • {fio}\n\
+             └ phone:{phone} • email:{email}\n\
+             └ amount:{amount} • status:{status} • course:{is_course} • test:{is_test}\n\
+             └ order:{order_id} • tinkoff:{tinkoff_order_id}\n"
+        ));
+        if let Some(fid) = fid {
+            out.push_str(&format!("└ franchise:{fid}"));
+            if let Some(sid) = sid {
+                out.push_str(&format!(" • school:{sid}"));
+            }
+            out.push('\n');
+        }
+        if !link.is_empty() {
+            out.push_str(&format!("└ link:{link}\n"));
+        }
+        if !cdt.is_empty() {
+            out.push_str(&format!("└ confirmed:{cdt}\n"));
+        }
+        out.push('\n');
+    }
+
+    Ok(out)
 }
 
 async fn query_lesson_feedback(
