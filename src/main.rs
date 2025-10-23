@@ -168,13 +168,7 @@ async fn webhook(
 }
 
 async fn handle_update(state: AppState, update: TamTamUpdate) {
-    info!(
-        "ids in update: recipient.chat_id={:?} recipient.user_id={:?} chat_id={:?} sender.user_id={:?}",
-        msg.recipient.chat_id,
-        msg.recipient.user_id,
-        msg.chat_id,
-        msg.sender.as_ref().and_then(|s| s.user_id),
-    );
+
     let Some(msg) = update.message else {
         return;
     };
