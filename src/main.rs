@@ -728,9 +728,9 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         r#"
         SELECT id,
                CONCAT_WS(' ', name, last_name) AS full_name,
-               username, email, phone
+               username, email
         FROM users
-        WHERE email LIKE ? OR phone LIKE ? OR username LIKE ?
+        WHERE email LIKE ? OR username LIKE ?
            OR name LIKE ? OR last_name LIKE ?
         ORDER BY id DESC
         LIMIT 10
