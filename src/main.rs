@@ -1,11 +1,17 @@
 use anyhow::Result;
 use axum::http::StatusCode;
-use axum::{routing::{get, post}, Json, Router};
+use axum::{
+    Json, Router,
+    routing::{get, post},
+};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::{MySqlConnectOptions, MySqlSslMode}, MySql, Pool, Row};
 use sqlx::pool::PoolOptions;
+use sqlx::{
+    MySql, Pool, Row,
+    mysql::{MySqlConnectOptions, MySqlSslMode},
+};
 use std::{env, str::FromStr};
 use tracing::{error, info};
 
@@ -20,7 +26,10 @@ async fn main() -> Result<()> {
         let _ = dotenvy::from_filename(&manifest_env);
     }
 
-    tracing_subscriber::fmt().with_env_filter("info").compact().init();
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .compact()
+        .init();
     println!("CWD: {}", std::env::current_dir()?.display());
 
     /* ---------- MySQL pools (TLS off to avoid 1835) ---------- */
@@ -28,7 +37,7 @@ async fn main() -> Result<()> {
     let db_rw_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set (ctoseo)");
     let rw_opts = MySqlConnectOptions::from_str(&db_rw_url)
         .expect("bad DATABASE_URL")
-        .ssl_mode(MySqlSslMode::Disabled);
+        .ssl_mode(MySqlSslMode::Required);
     let pool_rw = PoolOptions::<MySql>::new()
         .max_connections(10)
         .acquire_timeout(std::time::Duration::from_secs(10))
@@ -41,7 +50,7 @@ async fn main() -> Result<()> {
         .expect("CODECLASS_DATABASE_URL_RO not set (codeclass, RO)");
     let ro_opts = MySqlConnectOptions::from_str(&db_ro_url)
         .expect("bad CODECLASS_DATABASE_URL_RO")
-        .ssl_mode(MySqlSslMode::Disabled);
+        .ssl_mode(MySqlSslMode::Required);
     let pool_codeclass_ro = PoolOptions::<MySql>::new()
         .max_connections(10)
         .acquire_timeout(std::time::Duration::from_secs(10))
@@ -62,7 +71,10 @@ async fn main() -> Result<()> {
             kb,
         });
 
-    let port: u16 = env::var("PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3011);
+    let port: u16 = env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3011);
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     info!("Listening on {addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
@@ -183,7 +195,9 @@ async fn webhook(
 }
 
 async fn handle_update(state: AppState, update: TamTamUpdate) {
-    let Some(msg) = update.message else { return; };
+    let Some(msg) = update.message else {
+        return;
+    };
     let raw_text = msg.body.text.clone();
     let text = raw_text.trim().to_string();
     if text.is_empty() {
@@ -217,7 +231,7 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
                 },
             ],
         )
-            .await;
+        .await;
         let _ = send_tamtam(recipient, &reply).await;
         return;
     }
@@ -248,7 +262,7 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
                 },
             ],
         )
-            .await;
+        .await;
         let _ = send_tamtam(recipient, &answer).await;
         return;
     }
@@ -316,7 +330,7 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
             },
         ],
     )
-        .await
+    .await
     {
         error!("save_history_batch error: {e:?}");
     }
@@ -352,10 +366,10 @@ async fn load_history(pool: &Pool<MySql>, key: i64, limit: i64) -> Result<Vec<Op
         LIMIT ?
         "#,
     )
-        .bind(key)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    .bind(key)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
 
     let mut items: Vec<OpenAIMessage> = rows
         .into_iter()
@@ -380,12 +394,12 @@ async fn save_history_batch(pool: &Pool<MySql>, key: i64, msgs: &[OpenAIMessage]
             VALUES (?, ?, ?, ?)
             "#,
         )
-            .bind(key)
-            .bind(&m.role)
-            .bind(&m.content)
-            .bind(Utc::now().naive_utc())
-            .execute(&mut *tx)
-            .await?;
+        .bind(key)
+        .bind(&m.role)
+        .bind(&m.content)
+        .bind(Utc::now().naive_utc())
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -400,9 +414,9 @@ async fn load_facts(pool: &Pool<MySql>, key: i64) -> Result<Vec<String>> {
         LIMIT 50
         "#,
     )
-        .bind(key)
-        .fetch_all(pool)
-        .await?;
+    .bind(key)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows
         .into_iter()
@@ -450,11 +464,7 @@ fn token_overlap(a: &str, b: &str) -> f64 {
     let set_b: HashSet<_> = b.split_whitespace().collect();
     let inter = set_a.intersection(&set_b).count() as f64;
     let union = set_a.union(&set_b).count() as f64;
-    if union == 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
+    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 fn score(q: &str, cand: &str) -> f64 {
@@ -544,10 +554,7 @@ fn try_answer_from_json_qa(state: &AppState, query: &str) -> Option<String> {
     None
 }
 
-async fn weak_hints_from_codeclass_and_json(
-    state: &AppState,
-    query: &str,
-) -> Option<String> {
+async fn weak_hints_from_codeclass_and_json(state: &AppState, query: &str) -> Option<String> {
     let mut cand: Vec<(f64, String, String)> = Vec::new();
 
     if let Ok(rows) =
@@ -670,8 +677,7 @@ fn parse_ro_intent(text: &str) -> Option<RoIntent> {
     }
 
     // естественные фразы
-    let re_user =
-        Regex::new(r"(?i)(посмотри|найди).*(ученика|пользователя)\s+(.+)$").unwrap();
+    let re_user = Regex::new(r"(?i)(посмотри|найди).*(ученика|пользователя)\s+(.+)$").unwrap();
     if let Some(caps) = re_user.captures(&t) {
         if let Some(q) = caps.get(3) {
             let q = q.as_str().trim().to_string();
@@ -701,20 +707,10 @@ async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
         RoIntent::CourseFind(q) => query_courses(&state.pool_codeclass_ro, q.as_deref()).await,
         RoIntent::PricingFor(q) => query_pricing(&state.pool_codeclass_ro, q.as_deref()).await,
         RoIntent::ScheduleFor { course, date } => {
-            query_schedule(
-                &state.pool_codeclass_ro,
-                course.as_deref(),
-                date.as_deref(),
-            )
-                .await
+            query_schedule(&state.pool_codeclass_ro, course.as_deref(), date.as_deref()).await
         }
         RoIntent::LessonsFor { course, date } => {
-            query_lessons(
-                &state.pool_codeclass_ro,
-                course.as_deref(),
-                date.as_deref(),
-            )
-                .await
+            query_lessons(&state.pool_codeclass_ro, course.as_deref(), date.as_deref()).await
         }
         RoIntent::EnrollmentsFor(q) => query_enrollments(&state.pool_codeclass_ro, &q).await,
         RoIntent::OrdersFor(q) => query_orders(&state.pool_codeclass_ro, &q).await,
@@ -727,7 +723,7 @@ async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
             query_lesson_feedback(&state.pool_codeclass_ro, user.as_deref(), lesson_id).await
         }
     }
-        .unwrap_or_else(|e| format!("Ошибка запроса: {e:?}"));
+    .unwrap_or_else(|e| format!("Ошибка запроса: {e:?}"));
 
     Some(if out.is_empty() {
         "Ничего не найдено.".into()
@@ -752,13 +748,12 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         LIMIT 10
         "#,
     )
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .fetch_all(pool)
-        .await?;
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .fetch_all(pool)
+    .await?;
 
     let mut out = String::new();
     for r in rows {
@@ -766,8 +761,10 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         let name: String = r.try_get("full_name").unwrap_or_default();
         let username: String = r.try_get("username").unwrap_or_default();
         let email: String = r.try_get("email").unwrap_or_default();
-        let phone: String = r.try_get("phone").unwrap_or_default();
-        out.push_str(&format!("ID:{id} • {name} • @{username} • {email} • {phone}\n"));
+
+        out.push_str(&format!(
+            "ID:{id} • {name} • @{username} • {email}\n"
+        ));
     }
     Ok(out)
 }
@@ -782,11 +779,11 @@ async fn query_admin(pool: &Pool<MySql>, q: &str) -> Result<String> {
         LIMIT 10
         "#,
     )
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .fetch_all(pool)
-        .await?;
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .fetch_all(pool)
+    .await?;
 
     let mut out = String::new();
     for r in rows {
@@ -810,9 +807,9 @@ async fn query_courses(pool: &Pool<MySql>, q: Option<&str>) -> Result<String> {
             LIMIT 10
             "#,
         )
-            .bind(format!("%{}%", k))
-            .fetch_all(pool)
-            .await?
+        .bind(format!("%{}%", k))
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query(r#"SELECT id, title FROM courses ORDER BY id DESC LIMIT 10"#)
             .fetch_all(pool)
@@ -843,9 +840,9 @@ async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<
             LIMIT 10
             "#,
         )
-            .bind(format!("%{}%", k))
-            .fetch_all(pool)
-            .await?
+        .bind(format!("%{}%", k))
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query(
             r#"
@@ -859,8 +856,8 @@ async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<
             LIMIT 10
             "#,
         )
-            .fetch_all(pool)
-            .await?
+        .fetch_all(pool)
+        .await?
     };
 
     let mut out = String::new();
@@ -869,7 +866,9 @@ async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<
         let plan: String = r.try_get("plan_title").unwrap_or_default();
         let count_lesson: i64 = r.try_get("count_lesson").unwrap_or(0);
         let price: i64 = r.try_get("price").unwrap_or(0);
-        out.push_str(&format!("{course}: {plan} — {count_lesson} занятий • {price} ₽\n"));
+        out.push_str(&format!(
+            "{course}: {plan} — {count_lesson} занятий • {price} ₽\n"
+        ));
     }
     Ok(out)
 }
@@ -977,13 +976,13 @@ async fn find_user_id(pool: &Pool<MySql>, q: &str) -> Result<Option<i64>> {
         ORDER BY id DESC LIMIT 1
         "#,
     )
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .bind(format!("%{}%", q))
-        .fetch_optional(pool)
-        .await?;
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .bind(format!("%{}%", q))
+    .fetch_optional(pool)
+    .await?;
 
     Ok(row.and_then(|r| r.try_get::<i64, _>("id").ok()))
 }
@@ -1002,9 +1001,9 @@ async fn query_enrollments(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             LIMIT 10
             "#,
         )
-            .bind(uid)
-            .fetch_all(pool)
-            .await?;
+        .bind(uid)
+        .fetch_all(pool)
+        .await?;
 
         let mut out = format!("Записи для user_id={uid}:\n");
         for r in rows {
@@ -1035,9 +1034,9 @@ async fn query_orders(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             LIMIT 10
             "#,
         )
-            .bind(uid)
-            .fetch_all(pool)
-            .await?;
+        .bind(uid)
+        .fetch_all(pool)
+        .await?;
 
         let mut out = format!("Заказы для user_id={uid} (через invoices):\n");
         for r in rows {
@@ -1066,9 +1065,9 @@ async fn query_invoices(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             LIMIT 10
             "#,
         )
-            .bind(uid)
-            .fetch_all(pool)
-            .await?;
+        .bind(uid)
+        .fetch_all(pool)
+        .await?;
 
         let mut out = format!("Счета для user_id={uid}:\n");
         for r in rows {
@@ -1095,8 +1094,8 @@ async fn query_partner_payments(pool: &Pool<MySql>, _user_q: &str) -> Result<Str
         LIMIT 10
         "#,
     )
-        .fetch_all(pool)
-        .await?;
+    .fetch_all(pool)
+    .await?;
 
     let mut out = String::from("Последние партнёрские выплаты:\n");
     for r in rows {
@@ -1137,9 +1136,9 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             LIMIT 20
             "#,
         )
-            .bind(id)
-            .fetch_all(pool)
-            .await?
+        .bind(id)
+        .fetch_all(pool)
+        .await?
     } else {
         // Текстовый поиск по основным полям
         sqlx::query(
@@ -1166,15 +1165,15 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             LIMIT 20
             "#,
         )
-            .bind(q) // first_name
-            .bind(q) // last_name
-            .bind(q) // middle_name
-            .bind(q) // client_phone
-            .bind(q) // client_email
-            .bind(q) // order_id
-            .bind(q) // tinkoff_order_id
-            .fetch_all(pool)
-            .await?
+        .bind(q) // first_name
+        .bind(q) // last_name
+        .bind(q) // middle_name
+        .bind(q) // client_phone
+        .bind(q) // client_email
+        .bind(q) // order_id
+        .bind(q) // tinkoff_order_id
+        .fetch_all(pool)
+        .await?
     };
 
     if rows.is_empty() {
@@ -1207,12 +1206,16 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
         let dt: String = r.try_get("dt").unwrap_or_default();
         let cdt: String = r.try_get("cdt").unwrap_or_default();
 
-        let fio = [last_name.as_str(), first_name.as_str(), middle_name.as_str()]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let fio = [
+            last_name.as_str(),
+            first_name.as_str(),
+            middle_name.as_str(),
+        ]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
 
         out.push_str(&format!(
             "#{id} • {dt} • {fio}\n\
@@ -1256,9 +1259,9 @@ async fn query_lesson_feedback(
             LIMIT 10
             "#,
         )
-            .bind(id)
-            .fetch_all(pool)
-            .await?;
+        .bind(id)
+        .fetch_all(pool)
+        .await?;
 
         let mut out = format!("Фидбек по уроку #{id}:\n");
         for r in rows {
@@ -1283,9 +1286,9 @@ async fn query_lesson_feedback(
                 LIMIT 10
                 "#,
             )
-                .bind(uid)
-                .fetch_all(pool)
-                .await?;
+            .bind(uid)
+            .fetch_all(pool)
+            .await?;
 
             let mut out = format!("Фидбек пользователя user_id={uid}:\n");
             for r in rows {
@@ -1294,7 +1297,9 @@ async fn query_lesson_feedback(
                 let rating: i64 = r.try_get("rating").unwrap_or(0);
                 let c: String = r.try_get("c").unwrap_or_default();
                 let dt: String = r.try_get("dt").unwrap_or_default();
-                out.push_str(&format!("#{fid} • {dt} • lesson:{lid} • {rating}/5 • {c}\n"));
+                out.push_str(&format!(
+                    "#{fid} • {dt} • lesson:{lid} • {rating}/5 • {c}\n"
+                ));
             }
             return Ok(out);
         }
