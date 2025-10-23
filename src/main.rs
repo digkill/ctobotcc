@@ -4,8 +4,9 @@ use axum::{routing::{get, post}, Json, Router};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlRow, MySql, Pool, Row};
-use std::env;
+use sqlx::{mysql::{MySqlConnectOptions, MySqlSslMode}, MySql, Pool, Row};
+use sqlx::pool::PoolOptions;
+use std::{env, str::FromStr};
 use tracing::{error, info};
 
 /* ===================== entry ===================== */
@@ -22,15 +23,30 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").compact().init();
     println!("CWD: {}", std::env::current_dir()?.display());
 
-    // База ctoseo (RW)
-    let db_rw = std::env::var("DATABASE_URL").expect("DATABASE_URL not set (ctoseo)");
-    let pool_rw = Pool::<MySql>::connect(&db_rw).await?;
+    /* ---------- MySQL pools (TLS off to avoid 1835) ---------- */
+    // ctoseo (RW)
+    let db_rw_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set (ctoseo)");
+    let rw_opts = MySqlConnectOptions::from_str(&db_rw_url)
+        .expect("bad DATABASE_URL")
+        .ssl_mode(MySqlSslMode::Disabled);
+    let pool_rw = PoolOptions::<MySql>::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(rw_opts)
+        .await?;
     info!("Connected to MySQL (ctoseo, RW)");
 
-    // База codeclass (RO)
-    let db_ro = std::env::var("CODECLASS_DATABASE_URL_RO")
+    // codeclass (RO)
+    let db_ro_url = std::env::var("CODECLASS_DATABASE_URL_RO")
         .expect("CODECLASS_DATABASE_URL_RO not set (codeclass, RO)");
-    let pool_codeclass_ro = Pool::<MySql>::connect(&db_ro).await?;
+    let ro_opts = MySqlConnectOptions::from_str(&db_ro_url)
+        .expect("bad CODECLASS_DATABASE_URL_RO")
+        .ssl_mode(MySqlSslMode::Disabled);
+    let pool_codeclass_ro = PoolOptions::<MySql>::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect_with(ro_opts)
+        .await?;
     info!("Connected to MySQL (codeclass, RO)");
 
     // JSON Q&A
@@ -728,10 +744,10 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         r#"
         SELECT id,
                CONCAT_WS(' ', name, last_name) AS full_name,
-               username, email
+               username, email, phone
         FROM users
         WHERE email LIKE ? OR username LIKE ?
-           OR name LIKE ? OR last_name LIKE ?
+           OR name LIKE ? OR last_name LIKE ? OR phone LIKE ?
         ORDER BY id DESC
         LIMIT 10
         "#,
@@ -747,7 +763,7 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
     let mut out = String::new();
     for r in rows {
         let id: i64 = r.try_get("id")?;
-        let name: String = r.try_get("full_name")?;
+        let name: String = r.try_get("full_name").unwrap_or_default();
         let username: String = r.try_get("username").unwrap_or_default();
         let email: String = r.try_get("email").unwrap_or_default();
         let phone: String = r.try_get("phone").unwrap_or_default();
@@ -928,7 +944,7 @@ async fn query_lessons(
         binds.push(format!("%{}%", k));
     }
     if let Some(d) = date {
-        // если в lessons есть starts_at — подменишь здесь на неё
+        // если в lessons есть starts_at — подменить на него здесь
         q.push_str(" AND DATE(l.created_at) = ?");
         binds.push(d.to_string());
     }
@@ -1103,7 +1119,7 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
     // Если это чисто число — считаем, что хотят точный поиск по id.
     let numeric_id = q.parse::<i64>().ok();
 
-    let rows: Vec<MySqlRow> = if let Some(id) = numeric_id {
+    let rows = if let Some(id) = numeric_id {
         sqlx::query(
             r#"
             SELECT
@@ -1150,7 +1166,6 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             LIMIT 20
             "#,
         )
-            // Один и тот же паттерн биндится на все поля
             .bind(q) // first_name
             .bind(q) // last_name
             .bind(q) // middle_name
@@ -1199,7 +1214,6 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             .collect::<Vec<_>>()
             .join(" ");
 
-        // Строка-резюме по заявке
         out.push_str(&format!(
             "#{id} • {dt} • {fio}\n\
              └ phone:{phone} • email:{email}\n\
