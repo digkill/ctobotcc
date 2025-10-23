@@ -4,6 +4,7 @@ use axum::{Json, Router, routing::{get, post}};
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{MySql, Pool, Row};
 use std::env;
 use tracing::{error, info};
@@ -397,6 +398,7 @@ fn parse_ro_intent(text: &str) -> Option<RoIntent> {
     let t = text.trim().to_lowercase();
     let parts: Vec<&str> = t.split_whitespace().collect();
 
+    // Команды
     if parts.first().copied() == Some("/user") && parts.len() >= 2 {
         return Some(RoIntent::UserBy(parts[1..].join(" ")));
     }
@@ -444,23 +446,38 @@ fn parse_ro_intent(text: &str) -> Option<RoIntent> {
         }
     }
 
-    // простые естественные фразы
-    if t.starts_with("посмотри ученика ") || t.starts_with("найди ученика ") {
-        let q = t.splitn(2, ' ').nth(1).unwrap_or("").replace("ученика ", "");
-        if !q.is_empty() { return Some(RoIntent::UserBy(q)); }
+    // Естественные фразы (расширено)
+    // "посмотри в базе ученика вася", "найди ученика петров", "покажи студента иванов"
+    let re_user = Regex::new(r"(посмотри|найди|покажи).{0,20}?(ученик[а]?|студент[а]?)\s+(.+)$").unwrap();
+    if let Some(caps) = re_user.captures(&t) {
+        if let Some(q) = caps.get(3) {
+            let q = q.as_str().trim().to_string();
+            if !q.is_empty() { return Some(RoIntent::UserBy(q)); }
+        }
     }
-    if t.starts_with("расписание на ") {
-        let date = t.replace("расписание на ", "").trim().to_string();
-        return Some(RoIntent::ScheduleFor { course: None, date: Some(date) });
+
+    // "расписание на 2025-10-24", "расписание по курсу python на 2025-10-24"
+    let re_sched_date = Regex::new(r"расписан(ие|ья)\s*(по курсу\s+([^\s]+))?\s*на\s*([0-9]{4}-[0-9]{2}-[0-9]{2})").unwrap();
+    if let Some(caps) = re_sched_date.captures(&t) {
+        let course = caps.get(3).map(|m| m.as_str().to_string());
+        let date = caps.get(4).map(|m| m.as_str().to_string());
+        return Some(RoIntent::ScheduleFor { course, date });
     }
-    if t.starts_with("цены") || t.contains("прайс") {
-        return Some(RoIntent::PricingFor(None));
+
+    // "цены", "прайс", "стоимость курса python"
+    if t.contains("прайс") || t.starts_with("цены") || t.contains("стоимость курса") {
+        let re_course = Regex::new(r"стоимость курса\s+([^\s]+)").unwrap();
+        let course = re_course.captures(&t).and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+        return Some(RoIntent::PricingFor(course));
     }
+
     None
 }
 
 async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
     let intent = parse_ro_intent(text)?;
+    info!("RO intent: {:?}", intent);
+
     let out = match intent {
         RoIntent::UserBy(q) => query_user(&state.pool_codeclass_ro, &q).await,
         RoIntent::AdminBy(q) => query_admin(&state.pool_codeclass_ro, &q).await,
@@ -483,9 +500,13 @@ async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
 
 async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
     let rows = sqlx::query(
-        r#"SELECT id, full_name, email, phone
+        r#"SELECT
+               id,
+               COALESCE(full_name, name)          AS full_name,
+               email,
+               COALESCE(phone, phone_number, '')  AS phone
            FROM users
-           WHERE email LIKE ? OR phone LIKE ? OR full_name LIKE ?
+           WHERE (email LIKE ? OR COALESCE(phone, phone_number, '') LIKE ? OR COALESCE(full_name, name) LIKE ?)
            ORDER BY id DESC LIMIT 10"#
     )
         .bind(format!("%{}%", q))
@@ -493,12 +514,14 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         .bind(format!("%{}%", q))
         .fetch_all(pool).await?;
 
+    info!("query_user rows={}", rows.len());
+
     let mut out = String::new();
     for r in rows {
-        let id: i64 = r.try_get("id")?;
-        let name: String = r.try_get("full_name")?;
-        let email: String = r.try_get("email")?;
-        let phone: String = r.try_get("phone")?;
+        let id: i64   = r.try_get("id")?;
+        let name: String  = r.try_get("full_name")?;
+        let email: String = r.try_get("email").unwrap_or_default();
+        let phone: String = r.try_get("phone").unwrap_or_default();
         out.push_str(&format!("ID:{id} • {name} • {email} • {phone}\n"));
     }
     Ok(out)
@@ -506,20 +529,25 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
 
 async fn query_admin(pool: &Pool<MySql>, q: &str) -> Result<String> {
     let rows = sqlx::query(
-        r#"SELECT id, name, email
+        r#"SELECT
+               id,
+               COALESCE(name, full_name) AS name,
+               email
            FROM admins
-           WHERE email LIKE ? OR name LIKE ?
+           WHERE (email LIKE ? OR COALESCE(name, full_name) LIKE ?)
            ORDER BY id DESC LIMIT 10"#
     )
         .bind(format!("%{}%", q))
         .bind(format!("%{}%", q))
         .fetch_all(pool).await?;
 
+    info!("query_admin rows={}", rows.len());
+
     let mut out = String::new();
     for r in rows {
         let id: i64 = r.try_get("id")?;
-        let name: String = r.try_get("name")?;
-        let email: String = r.try_get("email")?;
+        let name: String  = r.try_get("name")?;
+        let email: String = r.try_get("email").unwrap_or_default();
         out.push_str(&format!("ID:{id} • {name} • {email}\n"));
     }
     Ok(out)
@@ -540,6 +568,8 @@ async fn query_courses(pool: &Pool<MySql>, q: Option<&str>) -> Result<String> {
         sqlx::query(r#"SELECT id, title, slug FROM courses ORDER BY id DESC LIMIT 10"#)
             .fetch_all(pool).await?
     };
+    info!("query_courses rows={}", rows.len());
+
     let mut out = String::new();
     for r in rows {
         let id: i64 = r.try_get("id")?;
@@ -571,6 +601,7 @@ async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<
         )
             .fetch_all(pool).await?
     };
+    info!("query_pricing rows={}", rows.len());
 
     let mut out = String::new();
     for r in rows {
@@ -605,6 +636,7 @@ async fn query_schedule(pool: &Pool<MySql>, course_like: Option<&str>, date: Opt
     let mut query = sqlx::query(&q);
     for b in binds { query = query.bind(b); }
     let rows = query.fetch_all(pool).await?;
+    info!("query_schedule rows={}", rows.len());
 
     let mut out = String::new();
     for r in rows {
@@ -639,6 +671,7 @@ async fn query_lessons(pool: &Pool<MySql>, course_like: Option<&str>, date: Opti
     let mut query = sqlx::query(&q);
     for b in binds { query = query.bind(b); }
     let rows = query.fetch_all(pool).await?;
+    info!("query_lessons rows={}", rows.len());
 
     let mut out = String::new();
     for r in rows {
@@ -654,7 +687,7 @@ async fn query_lessons(pool: &Pool<MySql>, course_like: Option<&str>, date: Opti
 async fn find_user_id(pool: &Pool<MySql>, q: &str) -> Result<Option<i64>> {
     let row = sqlx::query(
         r#"SELECT id FROM users
-           WHERE email LIKE ? OR phone LIKE ? OR full_name LIKE ?
+           WHERE (email LIKE ? OR COALESCE(phone, phone_number, '') LIKE ? OR COALESCE(full_name, name) LIKE ?)
            ORDER BY id DESC LIMIT 1"#
     )
         .bind(format!("%{}%", q))
@@ -674,6 +707,7 @@ async fn query_enrollments(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
                WHERE e.user_id = ?
                ORDER BY e.id DESC LIMIT 10"#
         ).bind(uid).fetch_all(pool).await?;
+        info!("query_enrollments rows={}", rows.len());
 
         let mut out = format!("Записи для user_id={uid}:\n");
         for r in rows {
@@ -695,6 +729,7 @@ async fn query_orders(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
                WHERE user_id = ?
                ORDER BY id DESC LIMIT 10"#
         ).bind(uid).fetch_all(pool).await?;
+        info!("query_orders rows={}", rows.len());
 
         let mut out = format!("Заказы для user_id={uid}:\n");
         for r in rows {
@@ -717,6 +752,7 @@ async fn query_invoices(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
                WHERE user_id = ?
                ORDER BY id DESC LIMIT 10"#
         ).bind(uid).fetch_all(pool).await?;
+        info!("query_invoices rows={}", rows.len());
 
         let mut out = format!("Счета для user_id={uid}:\n");
         for r in rows {
@@ -739,6 +775,7 @@ async fn query_partner_payments(pool: &Pool<MySql>, user_q: &str) -> Result<Stri
                WHERE user_id = ?
                ORDER BY paid_at DESC LIMIT 10"#
         ).bind(uid).fetch_all(pool).await?;
+        info!("query_partner_payments rows={}", rows.len());
 
         let mut out = format!("Партнёрские платежи для user_id={uid}:\n");
         for r in rows {
@@ -761,6 +798,7 @@ async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
                WHERE user_id = ?
                ORDER BY id DESC LIMIT 10"#
         ).bind(uid).fetch_all(pool).await?;
+        info!("query_loan_apps rows={}", rows.len());
 
         let mut out = format!("Заявки на рассрочку для user_id={uid}:\n");
         for r in rows {
@@ -784,6 +822,7 @@ async fn query_lesson_feedback(pool: &Pool<MySql>, user_q: Option<&str>, lesson_
                WHERE lesson_id = ?
                ORDER BY created_at DESC LIMIT 10"#
         ).bind(id).fetch_all(pool).await?;
+        info!("query_lesson_feedback(by lesson) rows={}", rows.len());
 
         let mut out = format!("Фидбек по уроку #{id}:\n");
         for r in rows {
@@ -803,6 +842,7 @@ async fn query_lesson_feedback(pool: &Pool<MySql>, user_q: Option<&str>, lesson_
                    WHERE user_id = ?
                    ORDER BY created_at DESC LIMIT 10"#
             ).bind(uid).fetch_all(pool).await?;
+            info!("query_lesson_feedback(by user) rows={}", rows.len());
 
             let mut out = format!("Фидбек пользователя user_id={uid}:\n");
             for r in rows {
@@ -821,8 +861,6 @@ async fn query_lesson_feedback(pool: &Pool<MySql>, user_q: Option<&str>, lesson_
 }
 
 /* ===================== TamTam send ========================= */
-
-use serde_json::json;
 
 async fn send_tamtam(recipient: TTRecipientKind, text: &str) -> Result<()> {
     let token = std::env::var("TT_BOT_TOKEN").expect("TT_BOT_TOKEN not set");
