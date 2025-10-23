@@ -276,6 +276,7 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "msg",
  "regex",
  "reqwest",
  "serde",
@@ -907,6 +908,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-synesthesist"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af54084064d206ba671ba1bed9de19e9775bec26fef3d19cc3476085f7547870"
+
+[[package]]
 name = "ipnet"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1059,6 +1066,15 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "msg"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "afd5e70f68c3504344212938b2a41a6c299444f00ccb1dded0b4f26ffaf55cc4"
+dependencies = [
+ "io-synesthesist",
 ]
 
 [[package]]
