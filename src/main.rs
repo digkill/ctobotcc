@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         .init();
     println!("CWD: {}", std::env::current_dir()?.display());
 
-    /* ---------- MySQL pools (TLS off to avoid 1835) ---------- */
+    /* ---------- MySQL pools (TLS REQUIRED to avoid 1835) ---------- */
     // ctoseo (RW)
     let db_rw_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set (ctoseo)");
     let rw_opts = MySqlConnectOptions::from_str(&db_rw_url)
@@ -231,7 +231,7 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
                 },
             ],
         )
-        .await;
+            .await;
         let _ = send_tamtam(recipient, &reply).await;
         return;
     }
@@ -262,7 +262,7 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
                 },
             ],
         )
-        .await;
+            .await;
         let _ = send_tamtam(recipient, &answer).await;
         return;
     }
@@ -330,7 +330,7 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
             },
         ],
     )
-    .await
+        .await
     {
         error!("save_history_batch error: {e:?}");
     }
@@ -366,10 +366,10 @@ async fn load_history(pool: &Pool<MySql>, key: i64, limit: i64) -> Result<Vec<Op
         LIMIT ?
         "#,
     )
-    .bind(key)
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+        .bind(key)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
 
     let mut items: Vec<OpenAIMessage> = rows
         .into_iter()
@@ -394,12 +394,12 @@ async fn save_history_batch(pool: &Pool<MySql>, key: i64, msgs: &[OpenAIMessage]
             VALUES (?, ?, ?, ?)
             "#,
         )
-        .bind(key)
-        .bind(&m.role)
-        .bind(&m.content)
-        .bind(Utc::now().naive_utc())
-        .execute(&mut *tx)
-        .await?;
+            .bind(key)
+            .bind(&m.role)
+            .bind(&m.content)
+            .bind(Utc::now().naive_utc())
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(())
@@ -414,9 +414,9 @@ async fn load_facts(pool: &Pool<MySql>, key: i64) -> Result<Vec<String>> {
         LIMIT 50
         "#,
     )
-    .bind(key)
-    .fetch_all(pool)
-    .await?;
+        .bind(key)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .into_iter()
@@ -723,7 +723,7 @@ async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
             query_lesson_feedback(&state.pool_codeclass_ro, user.as_deref(), lesson_id).await
         }
     }
-    .unwrap_or_else(|e| format!("Ошибка запроса: {e:?}"));
+        .unwrap_or_else(|e| format!("Ошибка запроса: {e:?}"));
 
     Some(if out.is_empty() {
         "Ничего не найдено.".into()
@@ -735,10 +735,10 @@ async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
 /* ===================== Конкретные SELECT-запросы (RO) ===================== */
 
 async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
-    // users: name, last_name, username, phone, email
+    // users: name, last_name, username, email
     let rows = sqlx::query(
         r#"
-        SELECT id,
+        SELECT CAST(id AS SIGNED) AS id,
                CONCAT_WS(' ', name, last_name) AS full_name,
                username, email
         FROM users
@@ -748,12 +748,12 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         LIMIT 10
         "#,
     )
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .fetch_all(pool)
-    .await?;
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .fetch_all(pool)
+        .await?;
 
     let mut out = String::new();
     for r in rows {
@@ -761,10 +761,7 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
         let name: String = r.try_get("full_name").unwrap_or_default();
         let username: String = r.try_get("username").unwrap_or_default();
         let email: String = r.try_get("email").unwrap_or_default();
-
-        out.push_str(&format!(
-            "ID:{id} • {name} • @{username} • {email}\n"
-        ));
+        out.push_str(&format!("ID:{id} • {name} • @{username} • {email}\n"));
     }
     Ok(out)
 }
@@ -772,18 +769,18 @@ async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
 async fn query_admin(pool: &Pool<MySql>, q: &str) -> Result<String> {
     let rows = sqlx::query(
         r#"
-        SELECT id, name, username, email
+        SELECT CAST(id AS SIGNED) AS id, name, username, email
         FROM admins
         WHERE email LIKE ? OR name LIKE ? OR username LIKE ?
         ORDER BY id DESC
         LIMIT 10
         "#,
     )
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .fetch_all(pool)
-    .await?;
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .fetch_all(pool)
+        .await?;
 
     let mut out = String::new();
     for r in rows {
@@ -800,18 +797,18 @@ async fn query_courses(pool: &Pool<MySql>, q: Option<&str>) -> Result<String> {
     let rows = if let Some(k) = q {
         sqlx::query(
             r#"
-            SELECT id, title
+            SELECT CAST(id AS SIGNED) AS id, title
             FROM courses
             WHERE title LIKE ?
             ORDER BY id DESC
             LIMIT 10
             "#,
         )
-        .bind(format!("%{}%", k))
-        .fetch_all(pool)
-        .await?
+            .bind(format!("%{}%", k))
+            .fetch_all(pool)
+            .await?
     } else {
-        sqlx::query(r#"SELECT id, title FROM courses ORDER BY id DESC LIMIT 10"#)
+        sqlx::query(r#"SELECT CAST(id AS SIGNED) AS id, title FROM courses ORDER BY id DESC LIMIT 10"#)
             .fetch_all(pool)
             .await?
     };
@@ -840,9 +837,9 @@ async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<
             LIMIT 10
             "#,
         )
-        .bind(format!("%{}%", k))
-        .fetch_all(pool)
-        .await?
+            .bind(format!("%{}%", k))
+            .fetch_all(pool)
+            .await?
     } else {
         sqlx::query(
             r#"
@@ -856,8 +853,8 @@ async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<
             LIMIT 10
             "#,
         )
-        .fetch_all(pool)
-        .await?
+            .fetch_all(pool)
+            .await?
     };
 
     let mut out = String::new();
@@ -881,7 +878,7 @@ async fn query_schedule(
     // schedules → groups → courses, дата: COALESCE(start_at, date_start)
     let mut q = String::from(
         r#"
-        SELECT s.id,
+        SELECT CAST(s.id AS SIGNED) AS id,
                c.title AS course,
                DATE_FORMAT(COALESCE(s.start_at, s.date_start), '%Y-%m-%d %H:%i') AS dt,
                g.title AS group_name
@@ -927,7 +924,7 @@ async fn query_lessons(
     // lessons → course_lesson → courses
     let mut q = String::from(
         r#"
-        SELECT l.id,
+        SELECT CAST(l.id AS SIGNED) AS id,
                l.title AS lesson,
                c.title AS course,
                DATE_FORMAT(l.created_at, '%Y-%m-%d %H:%i') AS dt
@@ -969,20 +966,20 @@ async fn query_lessons(
 async fn find_user_id(pool: &Pool<MySql>, q: &str) -> Result<Option<i64>> {
     let row = sqlx::query(
         r#"
-        SELECT id
+        SELECT CAST(id AS SIGNED) AS id
         FROM users
         WHERE email LIKE ? OR phone LIKE ? OR username LIKE ?
            OR name LIKE ? OR last_name LIKE ?
         ORDER BY id DESC LIMIT 1
         "#,
     )
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .bind(format!("%{}%", q))
-    .fetch_optional(pool)
-    .await?;
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .fetch_optional(pool)
+        .await?;
 
     Ok(row.and_then(|r| r.try_get::<i64, _>("id").ok()))
 }
@@ -991,7 +988,7 @@ async fn query_enrollments(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
     if let Some(uid) = find_user_id(pool, user_q).await? {
         let rows = sqlx::query(
             r#"
-            SELECT e.id,
+            SELECT CAST(e.id AS SIGNED) AS id,
                    c.title AS course,
                    e.status
             FROM enrollments e
@@ -1001,9 +998,9 @@ async fn query_enrollments(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             LIMIT 10
             "#,
         )
-        .bind(uid)
-        .fetch_all(pool)
-        .await?;
+            .bind(uid)
+            .fetch_all(pool)
+            .await?;
 
         let mut out = format!("Записи для user_id={uid}:\n");
         for r in rows {
@@ -1021,7 +1018,7 @@ async fn query_orders(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
     if let Some(uid) = find_user_id(pool, user_q).await? {
         let rows = sqlx::query(
             r#"
-            SELECT o.id,
+            SELECT CAST(o.id AS SIGNED) AS id,
                    o.total_amount,
                    o.status,
                    DATE_FORMAT(o.created_at, '%Y-%m-%d') AS dt
@@ -1034,9 +1031,9 @@ async fn query_orders(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             LIMIT 10
             "#,
         )
-        .bind(uid)
-        .fetch_all(pool)
-        .await?;
+            .bind(uid)
+            .fetch_all(pool)
+            .await?;
 
         let mut out = format!("Заказы для user_id={uid} (через invoices):\n");
         for r in rows {
@@ -1055,7 +1052,7 @@ async fn query_invoices(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
     if let Some(uid) = find_user_id(pool, user_q).await? {
         let rows = sqlx::query(
             r#"
-            SELECT id,
+            SELECT CAST(id AS SIGNED) AS id,
                    pay_amount,
                    status,
                    DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
@@ -1065,9 +1062,9 @@ async fn query_invoices(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             LIMIT 10
             "#,
         )
-        .bind(uid)
-        .fetch_all(pool)
-        .await?;
+            .bind(uid)
+            .fetch_all(pool)
+            .await?;
 
         let mut out = format!("Счета для user_id={uid}:\n");
         for r in rows {
@@ -1075,7 +1072,7 @@ async fn query_invoices(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
             let amount: f64 = r.try_get("pay_amount").unwrap_or(0.0);
             let status: i64 = r.try_get("status").unwrap_or(0);
             let dt: String = r.try_get("dt").unwrap_or_default();
-            out.push_str(&format!("#{id} • {dt} • {amount} • status={status}\n"));
+            out.push_str(&format!("#{id} • {dt} • {amount} • status:{status}\n"));
         }
         return Ok(out);
     }
@@ -1086,7 +1083,7 @@ async fn query_partner_payments(pool: &Pool<MySql>, _user_q: &str) -> Result<Str
     // В таблице payments_partners нет user_id — отдаем последние записи
     let rows = sqlx::query(
         r#"
-        SELECT id, name, total_payable,
+        SELECT CAST(id AS SIGNED) AS id, name, total_payable,
                DATE_FORMAT(period_from, '%Y-%m-%d') AS dfrom,
                DATE_FORMAT(period_to, '%Y-%m-%d')   AS dto
         FROM payments_partners
@@ -1094,8 +1091,8 @@ async fn query_partner_payments(pool: &Pool<MySql>, _user_q: &str) -> Result<Str
         LIMIT 10
         "#,
     )
-    .fetch_all(pool)
-    .await?;
+        .fetch_all(pool)
+        .await?;
 
     let mut out = String::from("Последние партнёрские выплаты:\n");
     for r in rows {
@@ -1122,7 +1119,9 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
         sqlx::query(
             r#"
             SELECT
-              id, franchise_id, school_id,
+              CAST(id AS SIGNED)            AS id,
+              CAST(franchise_id AS SIGNED)  AS franchise_id,
+              CAST(school_id AS SIGNED)     AS school_id,
               first_name, last_name, middle_name,
               client_phone, client_email,
               order_id, tinkoff_order_id, link,
@@ -1136,15 +1135,17 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             LIMIT 20
             "#,
         )
-        .bind(id)
-        .fetch_all(pool)
-        .await?
+            .bind(id)
+            .fetch_all(pool)
+            .await?
     } else {
         // Текстовый поиск по основным полям
         sqlx::query(
             r#"
             SELECT
-              id, franchise_id, school_id,
+              CAST(id AS SIGNED)            AS id,
+              CAST(franchise_id AS SIGNED)  AS franchise_id,
+              CAST(school_id AS SIGNED)     AS school_id,
               first_name, last_name, middle_name,
               client_phone, client_email,
               order_id, tinkoff_order_id, link,
@@ -1165,15 +1166,15 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             LIMIT 20
             "#,
         )
-        .bind(q) // first_name
-        .bind(q) // last_name
-        .bind(q) // middle_name
-        .bind(q) // client_phone
-        .bind(q) // client_email
-        .bind(q) // order_id
-        .bind(q) // tinkoff_order_id
-        .fetch_all(pool)
-        .await?
+            .bind(q) // first_name
+            .bind(q) // last_name
+            .bind(q) // middle_name
+            .bind(q) // client_phone
+            .bind(q) // client_email
+            .bind(q) // order_id
+            .bind(q) // tinkoff_order_id
+            .fetch_all(pool)
+            .await?
     };
 
     if rows.is_empty() {
@@ -1211,11 +1212,11 @@ pub async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String>
             first_name.as_str(),
             middle_name.as_str(),
         ]
-        .iter()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" ");
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ");
 
         out.push_str(&format!(
             "#{id} • {dt} • {fio}\n\
@@ -1250,7 +1251,10 @@ async fn query_lesson_feedback(
     if let Some(id) = lesson_id {
         let rows = sqlx::query(
             r#"
-            SELECT id, lesson_id, user_id, rating,
+            SELECT CAST(id AS SIGNED) AS id,
+                   CAST(lesson_id AS SIGNED) AS lesson_id,
+                   CAST(user_id  AS SIGNED)  AS user_id,
+                   rating,
                    LEFT(comment, 140) AS c,
                    DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
             FROM lesson_feedback
@@ -1259,9 +1263,9 @@ async fn query_lesson_feedback(
             LIMIT 10
             "#,
         )
-        .bind(id)
-        .fetch_all(pool)
-        .await?;
+            .bind(id)
+            .fetch_all(pool)
+            .await?;
 
         let mut out = format!("Фидбек по уроку #{id}:\n");
         for r in rows {
@@ -1277,7 +1281,9 @@ async fn query_lesson_feedback(
         if let Some(uid) = find_user_id(pool, uq).await? {
             let rows = sqlx::query(
                 r#"
-                SELECT id, lesson_id, rating,
+                SELECT CAST(id AS SIGNED) AS id,
+                       CAST(lesson_id AS SIGNED) AS lesson_id,
+                       rating,
                        LEFT(comment, 140) AS c,
                        DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
                 FROM lesson_feedback
@@ -1286,9 +1292,9 @@ async fn query_lesson_feedback(
                 LIMIT 10
                 "#,
             )
-            .bind(uid)
-            .fetch_all(pool)
-            .await?;
+                .bind(uid)
+                .fetch_all(pool)
+                .await?;
 
             let mut out = format!("Фидбек пользователя user_id={uid}:\n");
             for r in rows {
