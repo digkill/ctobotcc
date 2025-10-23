@@ -92,7 +92,9 @@ struct TamTamSender { #[serde(default)] user_id: Option<i64> }
 enum TTRecipientKind { Chat(i64), User(i64) }
 
 fn pick_recipient(msg: &TamTamMessageWrapper) -> Option<TTRecipientKind> {
-    if let Some(id) = msg.recipient.chat_id.or(msg.chat_id).or(msg.chat.as_ref().and_then(|c| c.chat_id)) {
+    if let Some(id) = msg.recipient.chat_id
+        .or(msg.chat_id)
+        .or(msg.chat.as_ref().and_then(|c| c.chat_id)) {
         return Some(TTRecipientKind::Chat(id));
     }
     if let Some(uid) = msg.recipient.user_id { return Some(TTRecipientKind::User(uid)); }
@@ -138,11 +140,21 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
     // ключ истории: чаты — chat_id, личка — -user_id
     let hist_key = match recipient { TTRecipientKind::Chat(id) => id, TTRecipientKind::User(uid) => -uid };
 
+    // === Быстрые ответы из codeclass (RO) — до Q&A/LLM ===
+    if let Some(reply) = handle_ro_db_queries(&state, &text).await {
+        let _ = save_history_batch(&state.pool_rw, hist_key, &[
+            OpenAIMessage { role:"user".into(), content: text.clone() },
+            OpenAIMessage { role:"assistant".into(), content: reply.clone() },
+        ]).await;
+        let _ = send_tamtam(recipient, &reply).await;
+        return;
+    }
+
     // Всегда CodeClassGPT
     let system_prompt = codeclassgpt_prompt();
     let history_max: i64 = env::var("HISTORY_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
 
-    // 0) Попытка ответить из Q&A (Только codeclass.RO → затем JSON)
+    // 0) Попытка ответить из Q&A (codeclass.RO → JSON)
     if let Some(answer) = try_answer_from_codeclass_qa(&state, &text).await
         .or_else(|| try_answer_from_json_qa(&state, &text))
     {
@@ -251,7 +263,7 @@ async fn load_facts(pool: &Pool<MySql>, key: i64) -> Result<Vec<String>> {
     Ok(rows.into_iter().map(|row| row.try_get::<String, _>("content").unwrap_or_default()).collect())
 }
 
-/* ================== Q&A knowledge ============================= */
+/* ================== Q&A knowledge (JSON) ============================= */
 
 #[derive(Clone, Default)]
 struct KnowledgeBase { qa: Vec<QaPair> }   // JSON-пласт (опционально)
@@ -299,7 +311,6 @@ fn load_kb_json(path: &str) -> KnowledgeBase {
 async fn try_answer_from_codeclass_qa(state: &AppState, query: &str) -> Option<String> {
     let mut best: Option<(f64, String)> = None;
 
-    // читаем ТОЛЬКО из codeclass.RO
     if let Ok(rows) = sqlx::query("SELECT question, answer FROM qa_pairs ORDER BY id DESC LIMIT 500")
         .fetch_all(&state.pool_codeclass_ro).await
     {
@@ -360,6 +371,451 @@ async fn weak_hints_from_codeclass_and_json(state: &AppState, query: &str) -> Op
         out.push_str(&format!("- Вопрос: {}\n  Ответ: {}\n", q, a));
     }
     Some(out)
+}
+
+/* ===================== codeclass (RO) quick queries ===================== */
+
+#[derive(Debug)]
+enum RoIntent {
+    UserBy(String),
+    AdminBy(String),
+    CourseFind(Option<String>),
+    PricingFor(Option<String>),
+    ScheduleFor { course: Option<String>, date: Option<String> },
+    LessonsFor { course: Option<String>, date: Option<String> },
+    EnrollmentsFor(String),
+    OrdersFor(String),
+    InvoicesFor(String),
+    PartnerPaymentsFor(String),
+    LoanAppsFor(String),
+    LessonFeedbackFor { user: Option<String>, lesson_id: Option<i64> },
+}
+
+fn parse_ro_intent(text: &str) -> Option<RoIntent> {
+    let t = text.trim().to_lowercase();
+    let parts: Vec<&str> = t.split_whitespace().collect();
+
+    if parts.first().copied() == Some("/user") && parts.len() >= 2 {
+        return Some(RoIntent::UserBy(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/admin") && parts.len() >= 2 {
+        return Some(RoIntent::AdminBy(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/courses") {
+        return Some(RoIntent::CourseFind(parts.get(1).map(|s| s.to_string())));
+    }
+    if parts.first().copied() == Some("/pricing") {
+        return Some(RoIntent::PricingFor(parts.get(1).map(|s| s.to_string())));
+    }
+    if parts.first().copied() == Some("/schedule") {
+        let course = parts.get(1).map(|s| s.to_string());
+        let date = parts.get(2).map(|s| s.to_string());
+        return Some(RoIntent::ScheduleFor { course, date });
+    }
+    if parts.first().copied() == Some("/lessons") {
+        let course = parts.get(1).map(|s| s.to_string());
+        let date = parts.get(2).map(|s| s.to_string());
+        return Some(RoIntent::LessonsFor { course, date });
+    }
+    if parts.first().copied() == Some("/enrollments") && parts.len() >= 2 {
+        return Some(RoIntent::EnrollmentsFor(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/orders") && parts.len() >= 2 {
+        return Some(RoIntent::OrdersFor(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/invoices") && parts.len() >= 2 {
+        return Some(RoIntent::InvoicesFor(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/partner_payments") && parts.len() >= 2 {
+        return Some(RoIntent::PartnerPaymentsFor(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/loan") && parts.len() >= 2 {
+        return Some(RoIntent::LoanAppsFor(parts[1..].join(" ")));
+    }
+    if parts.first().copied() == Some("/feedback") {
+        if parts.get(1) == Some(&"lesson") {
+            if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
+                return Some(RoIntent::LessonFeedbackFor { user: None, lesson_id: Some(id) });
+            }
+        } else if parts.get(1) == Some(&"user") && parts.len() >= 3 {
+            return Some(RoIntent::LessonFeedbackFor { user: Some(parts[2..].join(" ")), lesson_id: None });
+        }
+    }
+
+    // простые естественные фразы
+    if t.starts_with("посмотри ученика ") || t.starts_with("найди ученика ") {
+        let q = t.splitn(2, ' ').nth(1).unwrap_or("").replace("ученика ", "");
+        if !q.is_empty() { return Some(RoIntent::UserBy(q)); }
+    }
+    if t.starts_with("расписание на ") {
+        let date = t.replace("расписание на ", "").trim().to_string();
+        return Some(RoIntent::ScheduleFor { course: None, date: Some(date) });
+    }
+    if t.starts_with("цены") || t.contains("прайс") {
+        return Some(RoIntent::PricingFor(None));
+    }
+    None
+}
+
+async fn handle_ro_db_queries(state: &AppState, text: &str) -> Option<String> {
+    let intent = parse_ro_intent(text)?;
+    let out = match intent {
+        RoIntent::UserBy(q) => query_user(&state.pool_codeclass_ro, &q).await,
+        RoIntent::AdminBy(q) => query_admin(&state.pool_codeclass_ro, &q).await,
+        RoIntent::CourseFind(q) => query_courses(&state.pool_codeclass_ro, q.as_deref()).await,
+        RoIntent::PricingFor(q) => query_pricing(&state.pool_codeclass_ro, q.as_deref()).await,
+        RoIntent::ScheduleFor { course, date } => query_schedule(&state.pool_codeclass_ro, course.as_deref(), date.as_deref()).await,
+        RoIntent::LessonsFor { course, date } => query_lessons(&state.pool_codeclass_ro, course.as_deref(), date.as_deref()).await,
+        RoIntent::EnrollmentsFor(q) => query_enrollments(&state.pool_codeclass_ro, &q).await,
+        RoIntent::OrdersFor(q) => query_orders(&state.pool_codeclass_ro, &q).await,
+        RoIntent::InvoicesFor(q) => query_invoices(&state.pool_codeclass_ro, &q).await,
+        RoIntent::PartnerPaymentsFor(q) => query_partner_payments(&state.pool_codeclass_ro, &q).await,
+        RoIntent::LoanAppsFor(q) => query_loan_apps(&state.pool_codeclass_ro, &q).await,
+        RoIntent::LessonFeedbackFor { user, lesson_id } => query_lesson_feedback(&state.pool_codeclass_ro, user.as_deref(), lesson_id).await,
+    }.unwrap_or_else(|e| format!("Ошибка запроса: {e:?}"));
+
+    Some(if out.is_empty() { "Ничего не найдено.".into() } else { out })
+}
+
+/* ===================== Конкретные SELECT-запросы (RO) ===================== */
+
+async fn query_user(pool: &Pool<MySql>, q: &str) -> Result<String> {
+    let rows = sqlx::query(
+        r#"SELECT id, full_name, email, phone
+           FROM users
+           WHERE email LIKE ? OR phone LIKE ? OR full_name LIKE ?
+           ORDER BY id DESC LIMIT 10"#
+    )
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .fetch_all(pool).await?;
+
+    let mut out = String::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let name: String = r.try_get("full_name")?;
+        let email: String = r.try_get("email")?;
+        let phone: String = r.try_get("phone")?;
+        out.push_str(&format!("ID:{id} • {name} • {email} • {phone}\n"));
+    }
+    Ok(out)
+}
+
+async fn query_admin(pool: &Pool<MySql>, q: &str) -> Result<String> {
+    let rows = sqlx::query(
+        r#"SELECT id, name, email
+           FROM admins
+           WHERE email LIKE ? OR name LIKE ?
+           ORDER BY id DESC LIMIT 10"#
+    )
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .fetch_all(pool).await?;
+
+    let mut out = String::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let name: String = r.try_get("name")?;
+        let email: String = r.try_get("email")?;
+        out.push_str(&format!("ID:{id} • {name} • {email}\n"));
+    }
+    Ok(out)
+}
+
+async fn query_courses(pool: &Pool<MySql>, q: Option<&str>) -> Result<String> {
+    let rows = if let Some(k) = q {
+        sqlx::query(
+            r#"SELECT id, title, slug
+               FROM courses
+               WHERE title LIKE ? OR slug LIKE ?
+               ORDER BY id DESC LIMIT 10"#
+        )
+            .bind(format!("%{}%", k))
+            .bind(format!("%{}%", k))
+            .fetch_all(pool).await?
+    } else {
+        sqlx::query(r#"SELECT id, title, slug FROM courses ORDER BY id DESC LIMIT 10"#)
+            .fetch_all(pool).await?
+    };
+    let mut out = String::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let title: String = r.try_get("title")?;
+        let slug: String = r.try_get("slug")?;
+        out.push_str(&format!("ID:{id} • {title} • /{slug}\n"));
+    }
+    Ok(out)
+}
+
+async fn query_pricing(pool: &Pool<MySql>, course_like: Option<&str>) -> Result<String> {
+    let rows = if let Some(k) = course_like {
+        sqlx::query(
+            r#"SELECT p.course_id, c.title AS course, p.plan, p.price, p.currency
+               FROM pricing p
+               LEFT JOIN courses c ON c.id = p.course_id
+               WHERE c.title LIKE ? OR c.slug LIKE ?
+               ORDER BY p.course_id DESC, p.price ASC LIMIT 10"#
+        )
+            .bind(format!("%{}%", k))
+            .bind(format!("%{}%", k))
+            .fetch_all(pool).await?
+    } else {
+        sqlx::query(
+            r#"SELECT p.course_id, c.title AS course, p.plan, p.price, p.currency
+               FROM pricing p
+               LEFT JOIN courses c ON c.id = p.course_id
+               ORDER BY p.course_id DESC, p.price ASC LIMIT 10"#
+        )
+            .fetch_all(pool).await?
+    };
+
+    let mut out = String::new();
+    for r in rows {
+        let course: String = r.try_get("course").unwrap_or_default();
+        let plan: String = r.try_get("plan").unwrap_or_default();
+        let price: f64 = r.try_get("price").unwrap_or(0.0);
+        let cur: String = r.try_get("currency").unwrap_or_else(|_| "RUB".into());
+        out.push_str(&format!("{course}: {plan} — {price} {cur}\n"));
+    }
+    Ok(out)
+}
+
+async fn query_schedule(pool: &Pool<MySql>, course_like: Option<&str>, date: Option<&str>) -> Result<String> {
+    let mut q = String::from(
+        r#"SELECT s.id, c.title AS course, DATE_FORMAT(s.start_at, '%Y-%m-%d %H:%i') AS dt, s.group_name
+           FROM schedules s
+           LEFT JOIN courses c ON c.id = s.course_id
+           WHERE 1=1"#
+    );
+    let mut binds: Vec<String> = vec![];
+    if let Some(k) = course_like {
+        q.push_str(" AND (c.title LIKE ? OR c.slug LIKE ?)");
+        binds.push(format!("%{}%", k));
+        binds.push(format!("%{}%", k));
+    }
+    if let Some(d) = date {
+        q.push_str(" AND DATE(s.start_at) = ?");
+        binds.push(d.to_string());
+    }
+    q.push_str(" ORDER BY s.start_at ASC LIMIT 10");
+
+    let mut query = sqlx::query(&q);
+    for b in binds { query = query.bind(b); }
+    let rows = query.fetch_all(pool).await?;
+
+    let mut out = String::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let course: String = r.try_get("course")?;
+        let dt: String = r.try_get("dt")?;
+        let group: String = r.try_get("group_name").unwrap_or_default();
+        out.push_str(&format!("#{id} • {dt} • {course} • {group}\n"));
+    }
+    Ok(out)
+}
+
+async fn query_lessons(pool: &Pool<MySql>, course_like: Option<&str>, date: Option<&str>) -> Result<String> {
+    let mut q = String::from(
+        r#"SELECT l.id, c.title AS course, l.title AS lesson, DATE_FORMAT(l.starts_at, '%Y-%m-%d %H:%i') AS dt
+           FROM lessons l
+           LEFT JOIN courses c ON c.id = l.course_id
+           WHERE 1=1"#
+    );
+    let mut binds: Vec<String> = vec![];
+    if let Some(k) = course_like {
+        q.push_str(" AND (c.title LIKE ? OR c.slug LIKE ?)");
+        binds.push(format!("%{}%", k));
+        binds.push(format!("%{}%", k));
+    }
+    if let Some(d) = date {
+        q.push_str(" AND DATE(l.starts_at) = ?");
+        binds.push(d.to_string());
+    }
+    q.push_str(" ORDER BY l.starts_at ASC LIMIT 10");
+
+    let mut query = sqlx::query(&q);
+    for b in binds { query = query.bind(b); }
+    let rows = query.fetch_all(pool).await?;
+
+    let mut out = String::new();
+    for r in rows {
+        let id: i64 = r.try_get("id")?;
+        let course: String = r.try_get("course")?;
+        let lesson: String = r.try_get("lesson")?;
+        let dt: String = r.try_get("dt")?;
+        out.push_str(&format!("#{id} • {dt} • {course} — {lesson}\n"));
+    }
+    Ok(out)
+}
+
+async fn find_user_id(pool: &Pool<MySql>, q: &str) -> Result<Option<i64>> {
+    let row = sqlx::query(
+        r#"SELECT id FROM users
+           WHERE email LIKE ? OR phone LIKE ? OR full_name LIKE ?
+           ORDER BY id DESC LIMIT 1"#
+    )
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .bind(format!("%{}%", q))
+        .fetch_optional(pool).await?;
+
+    Ok(row.and_then(|r| r.try_get::<i64,_>("id").ok()))
+}
+
+async fn query_enrollments(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
+    if let Some(uid) = find_user_id(pool, user_q).await? {
+        let rows = sqlx::query(
+            r#"SELECT e.id, c.title AS course, e.status
+               FROM enrollments e
+               LEFT JOIN courses c ON c.id = e.course_id
+               WHERE e.user_id = ?
+               ORDER BY e.id DESC LIMIT 10"#
+        ).bind(uid).fetch_all(pool).await?;
+
+        let mut out = format!("Записи для user_id={uid}:\n");
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            let course: String = r.try_get("course")?;
+            let status: String = r.try_get("status").unwrap_or_default();
+            out.push_str(&format!("#{id} • {course} • {status}\n"));
+        }
+        return Ok(out);
+    }
+    Ok("Пользователь не найден.".into())
+}
+
+async fn query_orders(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
+    if let Some(uid) = find_user_id(pool, user_q).await? {
+        let rows = sqlx::query(
+            r#"SELECT id, total_amount, status, DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
+               FROM `order`
+               WHERE user_id = ?
+               ORDER BY id DESC LIMIT 10"#
+        ).bind(uid).fetch_all(pool).await?;
+
+        let mut out = format!("Заказы для user_id={uid}:\n");
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            let total: f64 = r.try_get("total_amount").unwrap_or(0.0);
+            let status: String = r.try_get("status").unwrap_or_default();
+            let dt: String = r.try_get("dt").unwrap_or_default();
+            out.push_str(&format!("#{id} • {dt} • {total} • {status}\n"));
+        }
+        return Ok(out);
+    }
+    Ok("Пользователь не найден.".into())
+}
+
+async fn query_invoices(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
+    if let Some(uid) = find_user_id(pool, user_q).await? {
+        let rows = sqlx::query(
+            r#"SELECT id, amount, status, DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
+               FROM invoices
+               WHERE user_id = ?
+               ORDER BY id DESC LIMIT 10"#
+        ).bind(uid).fetch_all(pool).await?;
+
+        let mut out = format!("Счета для user_id={uid}:\n");
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            let amount: f64 = r.try_get("amount").unwrap_or(0.0);
+            let status: String = r.try_get("status").unwrap_or_default();
+            let dt: String = r.try_get("dt").unwrap_or_default();
+            out.push_str(&format!("#{id} • {dt} • {amount} • {status}\n"));
+        }
+        return Ok(out);
+    }
+    Ok("Пользователь не найден.".into())
+}
+
+async fn query_partner_payments(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
+    if let Some(uid) = find_user_id(pool, user_q).await? {
+        let rows = sqlx::query(
+            r#"SELECT id, partner, amount, DATE_FORMAT(paid_at, '%Y-%m-%d') AS dt
+               FROM payments_partners
+               WHERE user_id = ?
+               ORDER BY paid_at DESC LIMIT 10"#
+        ).bind(uid).fetch_all(pool).await?;
+
+        let mut out = format!("Партнёрские платежи для user_id={uid}:\n");
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            let partner: String = r.try_get("partner").unwrap_or_default();
+            let amount: f64 = r.try_get("amount").unwrap_or(0.0);
+            let dt: String = r.try_get("dt").unwrap_or_default();
+            out.push_str(&format!("#{id} • {dt} • {partner} • {amount}\n"));
+        }
+        return Ok(out);
+    }
+    Ok("Пользователь не найден.".into())
+}
+
+async fn query_loan_apps(pool: &Pool<MySql>, user_q: &str) -> Result<String> {
+    if let Some(uid) = find_user_id(pool, user_q).await? {
+        let rows = sqlx::query(
+            r#"SELECT id, bank, term_months, status, DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
+               FROM loan_application
+               WHERE user_id = ?
+               ORDER BY id DESC LIMIT 10"#
+        ).bind(uid).fetch_all(pool).await?;
+
+        let mut out = format!("Заявки на рассрочку для user_id={uid}:\n");
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            let bank: String = r.try_get("bank").unwrap_or_default();
+            let term: i64 = r.try_get("term_months").unwrap_or(0);
+            let status: String = r.try_get("status").unwrap_or_default();
+            let dt: String = r.try_get("dt").unwrap_or_default();
+            out.push_str(&format!("#{id} • {dt} • {bank} • {term} мес • {status}\n"));
+        }
+        return Ok(out);
+    }
+    Ok("Пользователь не найден.".into())
+}
+
+async fn query_lesson_feedback(pool: &Pool<MySql>, user_q: Option<&str>, lesson_id: Option<i64>) -> Result<String> {
+    if let Some(id) = lesson_id {
+        let rows = sqlx::query(
+            r#"SELECT id, lesson_id, user_id, rating, LEFT(comment, 140) AS c, DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
+               FROM lesson_feedback
+               WHERE lesson_id = ?
+               ORDER BY created_at DESC LIMIT 10"#
+        ).bind(id).fetch_all(pool).await?;
+
+        let mut out = format!("Фидбек по уроку #{id}:\n");
+        for r in rows {
+            let fid: i64 = r.try_get("id")?;
+            let uid: i64 = r.try_get("user_id")?;
+            let rating: i64 = r.try_get("rating").unwrap_or(0);
+            let c: String = r.try_get("c").unwrap_or_default();
+            let dt: String = r.try_get("dt").unwrap_or_default();
+            out.push_str(&format!("#{fid} • {dt} • user:{uid} • {rating}/5 • {c}\n"));
+        }
+        return Ok(out);
+    } else if let Some(uq) = user_q {
+        if let Some(uid) = find_user_id(pool, uq).await? {
+            let rows = sqlx::query(
+                r#"SELECT id, lesson_id, rating, LEFT(comment, 140) AS c, DATE_FORMAT(created_at, '%Y-%m-%d') AS dt
+                   FROM lesson_feedback
+                   WHERE user_id = ?
+                   ORDER BY created_at DESC LIMIT 10"#
+            ).bind(uid).fetch_all(pool).await?;
+
+            let mut out = format!("Фидбек пользователя user_id={uid}:\n");
+            for r in rows {
+                let fid: i64 = r.try_get("id")?;
+                let lid: i64 = r.try_get("lesson_id")?;
+                let rating: i64 = r.try_get("rating").unwrap_or(0);
+                let c: String = r.try_get("c").unwrap_or_default();
+                let dt: String = r.try_get("dt").unwrap_or_default();
+                out.push_str(&format!("#{fid} • {dt} • lesson:{lid} • {rating}/5 • {c}\n"));
+            }
+            return Ok(out);
+        }
+        return Ok("Пользователь не найден.".into());
+    }
+    Ok("Укажи /feedback user <запрос> или /feedback lesson <id>.".into())
 }
 
 /* ===================== TamTam send ========================= */
