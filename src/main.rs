@@ -675,8 +675,35 @@ fn parse_mail_command(text: &str) -> Option<MailCommand> {
     Some(MailCommand::Help)
 }
 
+fn parse_mail_natural(text: &str) -> Option<MailCommand> {
+    let t = text.trim();
+    // create: "создай/создать/сделай ... почту/ящик <email> [пароль <pw>]"
+    let re_create = Regex::new(r"(?i)(создай|создать|сделай).*(почту|ящик)[^\S\r\n]+([\w.+-]+@[\w.-]+)(?:[^\S\r\n]+парол[ьяи]*[^\S\r\n]+(\S+))?").ok()?;
+    if let Some(c) = re_create.captures(t) {
+        let email = c.get(3).map(|m| m.as_str().to_string())?;
+        let password = c.get(4).map(|m| m.as_str().to_string());
+        return Some(MailCommand::Create { email, password });
+    }
+
+    // passwd: "поменять/сменить пароль <email> <новый>"
+    let re_pass = Regex::new(r"(?i)(поменять|сменить).*(парол[ьяи]).*?([\w.+-]+@[\w.-]+)[^\S\r\n]+(\S+)").ok()?;
+    if let Some(c) = re_pass.captures(t) {
+        let email = c.get(3).map(|m| m.as_str().to_string())?;
+        let password = c.get(4).map(|m| m.as_str().to_string())?;
+        return Some(MailCommand::Passwd { email, password });
+    }
+
+    // list: "список (почты|ящиков) <domain>"
+    let re_list = Regex::new(r"(?i)список.*(почты|ящиков)[^\S\r\n]+([\w.-]+)").ok()?;
+    if let Some(c) = re_list.captures(t) {
+        let domain = c.get(2).map(|m| m.as_str().to_string())?;
+        return Some(MailCommand::List { domain });
+    }
+    None
+}
+
 async fn handle_mail_commands(text: &str) -> Option<String> {
-    let cmd = parse_mail_command(text)?;
+    let cmd = parse_mail_command(text).or_else(|| parse_mail_natural(text))?;
     match cmd {
         MailCommand::Help => Some("Команды почты:\n/mail create <email> [password]\n/mail passwd <email> <new_password>\n/mail list <domain> — домены: code-class.ru, uchi.team".into()),
         MailCommand::List { domain } => {
