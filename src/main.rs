@@ -217,6 +217,20 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
         TTRecipientKind::User(uid) => -uid,
     };
 
+    // === Почта Beget — перехватываем сразу ===
+    if let Some(reply) = handle_mail_commands(&text).await {
+        let _ = save_history_batch(
+            &state.pool_rw,
+            hist_key,
+            &[
+                OpenAIMessage { role: "user".into(), content: raw_text },
+                OpenAIMessage { role: "assistant".into(), content: reply.clone() },
+            ],
+        ).await;
+        let _ = send_tamtam(recipient, &reply).await;
+        return;
+    }
+
     // === Быстрые селекты из codeclass (RO) — до Q&A/LLM ===
     if let Some(reply) = handle_ro_db_queries(&state, &text).await {
         let _ = save_history_batch(
@@ -238,19 +252,6 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
         return;
     }
 
-    // === Команды почты (Beget) ===
-    if let Some(reply) = handle_mail_commands(&text).await {
-        let _ = save_history_batch(
-            &state.pool_rw,
-            hist_key,
-            &[
-                OpenAIMessage { role: "user".into(), content: raw_text },
-                OpenAIMessage { role: "assistant".into(), content: reply.clone() },
-            ],
-        ).await;
-        let _ = send_tamtam(recipient, &reply).await;
-        return;
-    }
 
     // Persona — CodeClassGPT
     let system_prompt = codeclassgpt_prompt();
@@ -580,8 +581,14 @@ fn allowed_domain(d: &str) -> bool {
 }
 
 async fn beget_call(method: &str, input: Value) -> Result<Value> {
-    let login = env::var("BEGET_LOGIN").expect("BEGET_LOGIN not set");
-    let passwd = env::var("BEGET_PASSWD").expect("BEGET_PASSWD not set");
+    let login = match env::var("BEGET_LOGIN") {
+        Ok(v) => v,
+        Err(_) => anyhow::bail!("BEGET_LOGIN не задан. Добавь BEGET_LOGIN и BEGET_PASSWD в .env"),
+    };
+    let passwd = match env::var("BEGET_PASSWD") {
+        Ok(v) => v,
+        Err(_) => anyhow::bail!("BEGET_PASSWD не задан. Добавь BEGET_LOGIN и BEGET_PASSWD в .env"),
+    };
     let input_s = serde_json::to_string(&input)?;
     let url = format!(
         "{base}/{method}?login={login}&passwd={passwd}&input_format=json&output_format=json&input_data={data}",
