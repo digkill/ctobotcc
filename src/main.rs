@@ -7,6 +7,7 @@ use axum::{
 use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::pool::PoolOptions;
 use sqlx::{
     MySql, Pool, Row,
@@ -14,6 +15,7 @@ use sqlx::{
 };
 use std::{env, str::FromStr};
 use tracing::{error, info};
+use rand::{distributions::Alphanumeric, Rng};
 
 /* ===================== entry ===================== */
 
@@ -232,6 +234,20 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
             ],
         )
             .await;
+        let _ = send_tamtam(recipient, &reply).await;
+        return;
+    }
+
+    // === Команды почты (Beget) ===
+    if let Some(reply) = handle_mail_commands(&text).await {
+        let _ = save_history_batch(
+            &state.pool_rw,
+            hist_key,
+            &[
+                OpenAIMessage { role: "user".into(), content: raw_text },
+                OpenAIMessage { role: "assistant".into(), content: reply.clone() },
+            ],
+        ).await;
         let _ = send_tamtam(recipient, &reply).await;
         return;
     }
@@ -552,6 +568,165 @@ fn try_answer_from_json_qa(state: &AppState, query: &str) -> Option<String> {
         }
     }
     None
+}
+
+/* ===================== Beget Mail ============================= */
+
+const BEGET_API_BASE: &str = "https://api.beget.com/api/mail";
+const WEBMAIL_URL: &str = "https://web.beget.email/";
+
+fn allowed_domain(d: &str) -> bool {
+    matches!(d, "code-class.ru" | "uchi.team")
+}
+
+async fn beget_call(method: &str, input: Value) -> Result<Value> {
+    let login = env::var("BEGET_LOGIN").expect("BEGET_LOGIN not set");
+    let passwd = env::var("BEGET_PASSWD").expect("BEGET_PASSWD not set");
+    let input_s = serde_json::to_string(&input)?;
+    let url = format!(
+        "{base}/{method}?login={login}&passwd={passwd}&input_format=json&output_format=json&input_data={data}",
+        base = BEGET_API_BASE,
+        method = method,
+        login = urlencoding::encode(&login),
+        passwd = urlencoding::encode(&passwd),
+        data = urlencoding::encode(&input_s),
+    );
+    let client = reqwest::Client::new();
+    let res = client.get(url).send().await?;
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(format!("Beget HTTP {}: {}", status, text));
+    }
+    let val: Value = serde_json::from_str(&text).unwrap_or(Value::Bool(text.trim() == "true"));
+    Ok(val)
+}
+
+async fn beget_create_mailbox(domain: &str, mailbox: &str, password: &str) -> Result<bool> {
+    let v = beget_call(
+        "createMailbox",
+        serde_json::json!({"domain": domain, "mailbox": mailbox, "mailbox_password": password}),
+    )
+    .await?;
+    Ok(match v { Value::Bool(b) => b, _ => false })
+}
+
+async fn beget_change_mailbox_password(domain: &str, mailbox: &str, password: &str) -> Result<bool> {
+    let v = beget_call(
+        "changeMailboxPassword",
+        serde_json::json!({"domain": domain, "mailbox": mailbox, "mailbox_password": password}),
+    )
+    .await?;
+    Ok(match v { Value::Bool(b) => b, _ => false })
+}
+
+fn generate_password() -> String {
+    // 14 символов: буквы/цифры — максимально совместимо
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(14)
+        .map(char::from)
+        .collect()
+}
+
+fn format_mac_setup(email: &str, password: &str) -> String {
+    format!(
+        "Почта создана: {email}\nПароль: {password}\n\nВход в веб-почту: {web}\n\nНастройка в Mail (macOS):\n- Входящая IMAP: imap.beget.com — порт 993 (SSL) или 143 (STARTTLS)\n- Входящая POP3: pop3.beget.com — порт 995 (SSL) или 110 (STARTTLS)\n- Исходящая SMTP: smtp.beget.com — порт 465 (SSL) или 2525 (STARTTLS/без шифр.)\n- Аутентификация: обычный пароль\n\nЛогин везде: {email}",
+        email = email,
+        password = password,
+        web = WEBMAIL_URL,
+    )
+}
+
+enum MailCommand {
+    Create { email: String, password: Option<String> },
+    Passwd { email: String, password: String },
+    List { domain: String },
+    Help,
+}
+
+fn parse_mail_command(text: &str) -> Option<MailCommand> {
+    let t = text.trim();
+    if !t.starts_with("/mail") { return None; }
+    let parts: Vec<&str> = t.split_whitespace().collect();
+    if parts.len() == 1 { return Some(MailCommand::Help); }
+    match parts.get(1).copied().unwrap_or("") {
+        "create" => {
+            // /mail create <email> [password]
+            if let Some(email) = parts.get(2) {
+                let pass = parts.get(3).map(|s| s.to_string());
+                return Some(MailCommand::Create { email: email.to_string(), password: pass });
+            }
+        }
+        "passwd" | "password" => {
+            // /mail passwd <email> <newpass>
+            if let (Some(email), Some(pw)) = (parts.get(2), parts.get(3)) {
+                return Some(MailCommand::Passwd { email: email.to_string(), password: pw.to_string() });
+            }
+        }
+        "list" => {
+            // /mail list <domain>
+            if let Some(dom) = parts.get(2) {
+                return Some(MailCommand::List { domain: dom.to_string() });
+            }
+        }
+        _ => return Some(MailCommand::Help),
+    }
+    Some(MailCommand::Help)
+}
+
+async fn handle_mail_commands(text: &str) -> Option<String> {
+    let cmd = parse_mail_command(text)?;
+    match cmd {
+        MailCommand::Help => Some("Команды почты:\n/mail create <email> [password]\n/mail passwd <email> <new_password>\n/mail list <domain> — домены: code-class.ru, uchi.team".into()),
+        MailCommand::List { domain } => {
+            if !allowed_domain(&domain) {
+                return Some("Разрешены домены: code-class.ru, uchi.team".into());
+            }
+            let v = beget_call("getMailboxList", serde_json::json!({"domain": domain})).await.ok()?;
+            if let Some(arr) = v.as_array() {
+                if arr.is_empty() { return Some("Список пуст".into()); }
+                let mut out = String::new();
+                for it in arr {
+                    let mb = it.get("mailbox").and_then(|v| v.as_str()).unwrap_or("");
+                    let dm = it.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                    out.push_str(&format!("{}@{}\n", mb, dm));
+                }
+                Some(out)
+            } else {
+                Some("Не удалось получить список".into())
+            }
+        }
+        MailCommand::Create { email, password } => {
+            let (local, domain) = match email.split_once('@') {
+                Some((l, d)) => (l.to_string(), d.to_string()),
+                None => return Some("Укажи email: имя@code-class.ru или имя@uchi.team".into()),
+            };
+            if !allowed_domain(&domain) {
+                return Some("Разрешены домены: code-class.ru, uchi.team".into());
+            }
+            let pw = password.unwrap_or_else(generate_password);
+            match beget_create_mailbox(&domain, &local, &pw).await {
+                Ok(true) => Some(format_mac_setup(&format!("{}@{}", local, domain), &pw)),
+                Ok(false) => Some("Не удалось создать ящик (Beget вернул false)".into()),
+                Err(e) => Some(format!("Ошибка Beget: {e}")),
+            }
+        }
+        MailCommand::Passwd { email, password } => {
+            let (local, domain) = match email.split_once('@') {
+                Some((l, d)) => (l.to_string(), d.to_string()),
+                None => return Some("Укажи email: имя@code-class.ru или имя@uchi.team".into()),
+            };
+            if !allowed_domain(&domain) {
+                return Some("Разрешены домены: code-class.ru, uchi.team".into());
+            }
+            match beget_change_mailbox_password(&domain, &local, &password).await {
+                Ok(true) => Some(format!("Пароль обновлён для {}. Вход: {}", email, WEBMAIL_URL)),
+                Ok(false) => Some("Не удалось сменить пароль (Beget вернул false)".into()),
+                Err(e) => Some(format!("Ошибка Beget: {e}")),
+            }
+        }
+    }
 }
 
 async fn weak_hints_from_codeclass_and_json(state: &AppState, query: &str) -> Option<String> {
