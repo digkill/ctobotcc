@@ -217,6 +217,50 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
         TTRecipientKind::User(uid) => -uid,
     };
 
+    // === Правило: если команда начинается с '/', то НЕ использовать OpenAI ===
+    if text.starts_with('/') {
+        // 1) Почтовые команды
+        if let Some(reply) = handle_mail_commands(&text).await {
+            let _ = save_history_batch(
+                &state.pool_rw,
+                hist_key,
+                &[
+                    OpenAIMessage { role: "user".into(), content: raw_text.clone() },
+                    OpenAIMessage { role: "assistant".into(), content: reply.clone() },
+                ],
+            ).await;
+            let _ = send_tamtam(recipient, &reply).await;
+            return;
+        }
+
+        // 2) Быстрые RO-команды (БД codeclass)
+        if let Some(reply) = handle_ro_db_queries(&state, &text).await {
+            let _ = save_history_batch(
+                &state.pool_rw,
+                hist_key,
+                &[
+                    OpenAIMessage { role: "user".into(), content: raw_text.clone() },
+                    OpenAIMessage { role: "assistant".into(), content: reply.clone() },
+                ],
+            ).await;
+            let _ = send_tamtam(recipient, &reply).await;
+            return;
+        }
+
+        // 3) Неизвестная команда — короткая подсказка без OpenAI
+        let reply = "Неизвестная команда. Доступно: /mail create|passwd|list, /user, /admin, /courses, /pricing, /schedule, /lessons, /enrollments, /orders, /invoices, /partner_payments, /loan, /feedback";
+        let _ = save_history_batch(
+            &state.pool_rw,
+            hist_key,
+            &[
+                OpenAIMessage { role: "user".into(), content: raw_text.clone() },
+                OpenAIMessage { role: "assistant".into(), content: reply.to_string() },
+            ],
+        ).await;
+        let _ = send_tamtam(recipient, reply).await;
+        return;
+    }
+
     // === Почта Beget — перехватываем сразу ===
     if let Some(reply) = handle_mail_commands(&text).await {
         let _ = save_history_batch(
