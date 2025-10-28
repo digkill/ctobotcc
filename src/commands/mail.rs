@@ -229,7 +229,7 @@ fn generate_password() -> String {
 
 fn format_mac_setup(email: &str, password: &str) -> String {
     format!(
-        "Почта создана: {email}\nПароль: {password}\n\nВход в веб-почту: {web}\n\nНастройка в Mail (macOS):\n- Входящая IMAP: imap.beget.com — порт 993 (SSL) или 143 (STARTTLS)\n- Входящая POP3: pop3.beget.com — порт 995 (SSL) или 110 (STARTTLS)\n- Исходящая SMTP: smtp.beget.com — порт 465 (SSL) или 2525 (STARTTLS/без шифр.)\n- Аутентификация: обычный пароль\n\nЛогин везде: {email}",
+        "Почта создана: {email}\nПароль: {password}\n\nВход в веб-почту: {web}\n\nНастройка в Mail:\n- Входящая IMAP: imap.beget.com — порт 993 (SSL) или 143 (STARTTLS)\n- Входящая POP3: pop3.beget.com — порт 995 (SSL) или 110 (STARTTLS)\n- Исходящая SMTP: smtp.beget.com — порт 465 (SSL) или 2525 (STARTTLS/без шифр.)\n- Аутентификация: обычный пароль\n\nЛогин везде: {email}",
         email = email,
         password = password,
         web = WEBMAIL_URL,

@@ -1,12 +1,12 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::json;
-use tracing::error;
+use tracing::{error, info};
 use super::models::TTRecipientKind;
 
 /* ===================== TamTam send ========================= */
 
 pub async fn send_tamtam(recipient: TTRecipientKind, text: &str) -> Result<()> {
-    let token = std::env::var("TT_BOT_TOKEN").expect("TT_BOT_TOKEN not set");
+    let token = std::env::var("TT_BOT_TOKEN").map_err(|_| anyhow!("TT_BOT_TOKEN not set"))?;
     let mut url = format!(
         "https://botapi.tamtam.chat/messages?access_token={}",
         urlencoding::encode(&token)
@@ -17,10 +17,13 @@ pub async fn send_tamtam(recipient: TTRecipientKind, text: &str) -> Result<()> {
     }
     let body = json!({ "text": text });
     let client = reqwest::Client::new();
+    info!("TamTam send request: target={:?}", recipient);
     let res = client.post(url).json(&body).send().await?;
-    if !res.status().is_success() {
-        let t = res.text().await.unwrap_or_default();
-        error!("TamTam send failed: {}", t);
+    let status = res.status();
+    let t = res.text().await.unwrap_or_default();
+    if !status.is_success() {
+        error!("TamTam send failed: HTTP {} body: {}", status, t);
+        return Err(anyhow!(format!("TamTam HTTP {}", status)));
     }
     Ok(())
 }
