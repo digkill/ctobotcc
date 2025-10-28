@@ -4,13 +4,14 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::env;
+use tracing::info;
 
 /* ===================== Beget Mail ============================= */
 
 const BEGET_API_BASE: &str = "https://api.beget.com/api/mail";
 const WEBMAIL_URL: &str = "https://web.beget.email/";
 
-fn allowed_domain(d: &str) -> bool {
+pub fn allowed_domain(d: &str) -> bool {
     matches!(d, "code-class.ru" | "uchi.team")
 }
 
@@ -33,6 +34,8 @@ async fn beget_call(method: &str, input: Value) -> Result<Value> {
         Err(_) => anyhow::bail!("BEGET_PASSWD не задан. Добавь BEGET_LOGIN и BEGET_PASSWD в .env"),
     };
     let input_s = serde_json::to_string(&input)?;
+    // Log request without exposing credentials
+    info!("Beget API request: method={} input={}", method, input_s);
     let url = format!(
         "{base}/{method}?login={login}&passwd={passwd}&input_format=json&output_format=json&input_data={data}",
         base = BEGET_API_BASE,
@@ -45,6 +48,7 @@ async fn beget_call(method: &str, input: Value) -> Result<Value> {
     let res = client.get(url).send().await?;
     let status = res.status();
     let text = res.text().await.unwrap_or_default();
+    info!("Beget API response: {}", text);
     if !status.is_success() {
         anyhow::bail!(format!("Beget HTTP {}: {}", status, text));
     }
@@ -56,6 +60,28 @@ async fn beget_call(method: &str, input: Value) -> Result<Value> {
                 .error_text
                 .unwrap_or_else(|| "Unknown Beget error".to_string());
             return Err(anyhow::anyhow!(err));
+        }
+        // Some endpoints put nested status in `answer` → detect nested error
+        if let Some(obj) = envelope.answer.as_object() {
+            if let Some(st) = obj.get("status").and_then(|v| v.as_str()) {
+                if st.eq_ignore_ascii_case("error") {
+                    // Try to collect error_texts
+                    let msg = obj
+                        .get("errors")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            let mut parts: Vec<String> = Vec::new();
+                            for it in arr {
+                                if let Some(t) = it.get("error_text").and_then(|x| x.as_str()) {
+                                    parts.push(t.to_string());
+                                }
+                            }
+                            if parts.is_empty() { "Beget nested error".to_string() } else { parts.join(", ") }
+                        })
+                        .unwrap_or_else(|| "Beget nested error".to_string());
+                    return Err(anyhow::anyhow!(msg));
+                }
+            }
         }
         // Success, return the answer field
         return Ok(envelope.answer);
@@ -74,20 +100,106 @@ async fn beget_call(method: &str, input: Value) -> Result<Value> {
     anyhow::bail!(format!("Unexpected Beget API response: {}", text))
 }
 
-async fn beget_create_mailbox(domain: &str, mailbox: &str, password: &str) -> Result<bool> {
+pub async fn beget_create_mailbox(domain: &str, mailbox: &str, password: &str) -> Result<bool> {
     let v = beget_call(
         "createMailbox",
         serde_json::json!({"domain": domain, "mailbox": mailbox, "mailbox_password": password}),
     )
     .await?;
 
-    // The `createMailbox` method can return `true` directly on success,
-    // or an envelope with an `answer` field containing `true`.
     if let Some(b) = v.as_bool() {
         return Ok(b);
     }
-    
+    if let Some(obj) = v.as_object() {
+        if let Some(st) = obj.get("status").and_then(|v| v.as_str()) {
+            if st.eq_ignore_ascii_case("success") {
+                return Ok(true);
+            }
+            if st.eq_ignore_ascii_case("error") {
+                // Shouldn't reach here because beget_call would have errored already,
+                // but keep a safe fallback.
+                let msg: String = obj
+                    .get("errors")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.get(0))
+                    .and_then(|e| e.get("error_text"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Failed to create mailbox".to_string());
+                return Err(anyhow::anyhow!(msg));
+            }
+        }
+    }
+
     Ok(false)
+}
+
+pub async fn beget_drop_mailbox(domain: &str, mailbox: &str) -> Result<bool> {
+    let v = beget_call(
+        "dropMailbox",
+        serde_json::json!({"domain": domain, "mailbox": mailbox}),
+    )
+    .await?;
+
+    if let Some(b) = v.as_bool() {
+        return Ok(b);
+    }
+    if let Some(obj) = v.as_object() {
+        if let Some(st) = obj.get("status").and_then(|v| v.as_str()) {
+            if st.eq_ignore_ascii_case("success") {
+                return Ok(true);
+            }
+            if st.eq_ignore_ascii_case("error") {
+                let msg: String = obj
+                    .get("errors")
+                    .and_then(|v| v.as_array())
+                    .and_then(|arr| arr.get(0))
+                    .and_then(|e| e.get("error_text"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "Failed to drop mailbox".to_string());
+                return Err(anyhow::anyhow!(msg));
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub async fn beget_list_mailboxes(domain: &str) -> Result<Vec<String>> {
+    let v = beget_call(
+        "getMailboxList",
+        serde_json::json!({"domain": domain}),
+    )
+    .await?;
+
+    if let Some(arr) = v.as_array() {
+        let mut out: Vec<String> = Vec::new();
+        for it in arr {
+            let mb = it.get("mailbox").and_then(|v| v.as_str()).unwrap_or("");
+            let dm = it.get("domain").and_then(|v| v.as_str()).unwrap_or(domain);
+            if !mb.is_empty() {
+                out.push(format!("{}@{}", mb, dm));
+            }
+        }
+        return Ok(out);
+    }
+
+    // Some responses may wrap into {status, answer:[...]}
+    if let Some(obj) = v.as_object() {
+        if let Some(ans) = obj.get("answer").and_then(|x| x.as_array()) {
+            let mut out: Vec<String> = Vec::new();
+            for it in ans {
+                let mb = it.get("mailbox").and_then(|v| v.as_str()).unwrap_or("");
+                let dm = it.get("domain").and_then(|v| v.as_str()).unwrap_or(domain);
+                if !mb.is_empty() {
+                    out.push(format!("{}@{}", mb, dm));
+                }
+            }
+            return Ok(out);
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 async fn beget_change_mailbox_password(
@@ -136,6 +248,9 @@ enum MailCommand {
     List {
         domain: String,
     },
+    Drop {
+        email: String,
+    },
     Help,
 }
 
@@ -176,6 +291,14 @@ fn parse_mail_command(text: &str) -> Option<MailCommand> {
                 });
             }
         }
+        "drop" | "delete" => {
+            // /mail drop <email>
+            if let Some(email) = parts.get(2) {
+                return Some(MailCommand::Drop {
+                    email: email.to_string(),
+                });
+            }
+        }
         _ => return Some(MailCommand::Help),
     }
     Some(MailCommand::Help)
@@ -207,13 +330,21 @@ fn parse_mail_natural(text: &str) -> Option<MailCommand> {
         let domain = c.get(2).map(|m| m.as_str().to_string())?;
         return Some(MailCommand::List { domain });
     }
+
+    // drop: "удали(ть)/удалить ... почту/ящик <email>"
+    let re_drop = Regex::new(r"(?i)(удали|удалить).*(почту|ящик)[^\S\r\n]+([\w.+-]+@[\w.-]+)").ok()?;
+    if let Some(c) = re_drop.captures(t) {
+        let email = c.get(3).map(|m| m.as_str().to_string())?;
+        return Some(MailCommand::Drop { email });
+    }
+
     None
 }
 
 pub async fn handle_mail_commands(text: &str) -> Option<String> {
     let cmd = parse_mail_command(text).or_else(|| parse_mail_natural(text))?;
     match cmd {
-        MailCommand::Help => Some("Команды почты:\n/mail create <email> [password]\n/mail passwd <email> <new_password>\n/mail list <domain> — домены: code-class.ru, uchi.team".into()),
+        MailCommand::Help => Some("Команды почты:\n/mail create <email> [password]\n/mail passwd <email> <new_password>\n/mail list <domain>\n/mail drop <email> — домены: code-class.ru, uchi.team".into()),
         MailCommand::List { domain } => {
             if !allowed_domain(&domain) {
                 return Some("Разрешены домены: code-class.ru, uchi.team".into());
@@ -264,6 +395,20 @@ pub async fn handle_mail_commands(text: &str) -> Option<String> {
             match beget_change_mailbox_password(&domain, &local, &password).await {
                 Ok(true) => Some(format!("Пароль обновлён для {}. Вход: {}", email, WEBMAIL_URL)),
                 Ok(false) => Some("Не удалось сменить пароль (Beget вернул false)".into()),
+                Err(e) => Some(format!("Ошибка Beget: {e}")),
+            }
+        }
+        MailCommand::Drop { email } => {
+            let (local, domain) = match email.split_once('@') {
+                Some((l, d)) => (l.to_string(), d.to_string()),
+                None => return Some("Укажи email: имя@code-class.ru или имя@uchi.team".into()),
+            };
+            if !allowed_domain(&domain) {
+                return Some("Разрешены домены: code-class.ru, uchi.team".into());
+            }
+            match beget_drop_mailbox(&domain, &local).await {
+                Ok(true) => Some(format!("Почтовый ящик {} удалён.", email)),
+                Ok(false) => Some("Не удалось удалить ящик (Beget вернул false)".into()),
                 Err(e) => Some(format!("Ошибка Beget: {e}")),
             }
         }

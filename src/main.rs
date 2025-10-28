@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::{
     routing::{get},
     Router,
 };
+use clap::{Parser, Subcommand};
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use sqlx::pool::PoolOptions;
 use sqlx::{MySql, Pool};
@@ -20,6 +21,46 @@ mod tamtam;
 use handlers::webhook;
 use qa::KnowledgeBase;
 
+/* ===================== CLI ===================== */
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Create a new mailbox
+    CreateMailbox {
+        /// Local part (left of @) OR full email if you prefer
+        #[arg(short, long)]
+        email: String,
+
+        /// Password for the new mailbox
+        #[arg(short, long)]
+        password: String,
+
+        /// Domain where the mailbox will be created
+        #[arg(short = 'd', long = "domain")]
+        domain: String,
+    },
+    /// List all mailboxes for a domain
+    ListMailboxes {
+        /// Domain name
+        #[arg(short = 'd', long = "domain")]
+        domain: String,
+    },
+    /// Drop (delete) mailbox
+    DropMailbox {
+        /// Full email address
+        #[arg(short, long)]
+        email: String,
+    },
+}
+
+
 /* ===================== entry ===================== */
 
 #[tokio::main]
@@ -27,18 +68,75 @@ async fn main() -> Result<()> {
     // env: .env из CWD, затем — рядом с Cargo.toml
     let _ = dotenvy::dotenv();
     if std::env::var("DATABASE_URL").is_err() {
-        let manifest_env = format!("{}/.env", env!("CARGO_MANIFEST_DIR"));
-        let _ = dotenvy::from_filename(&manifest_env);
+        if let Ok(path) = std::env::var("CARGO_MANIFEST_DIR") {
+            let env_path = std::path::Path::new(&path).join(".env");
+            dotenvy::from_path(&env_path).ok();
+        }
     }
 
+    // Initialize logging FIRST.
     let file_appender = tracing_appender::rolling::daily(".", "ctobot.log");
     let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
-
     tracing_subscriber::registry()
         .with(EnvFilter::new("info"))
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
         .with(tracing_subscriber::fmt::layer().with_writer(non_blocking_appender))
         .init();
+
+    let cli = Cli::parse();
+
+    if let Some(command) = cli.command {
+        match command {
+            Commands::CreateMailbox { email, password, domain } => {
+                // Accept either local part or full email; normalize to local part
+                let local = if let Some((l, d)) = email.split_once('@') {
+                    if d != domain { bail!("Email domain and --domain mismatch"); }
+                    l.to_string()
+                } else {
+                    email
+                };
+                if !commands::mail::allowed_domain(&domain) {
+                    bail!("Domain not allowed. Allowed domains: code-class.ru, uchi.team");
+                }
+
+                println!("Creating mailbox {}@{}...", local, domain);
+                match commands::mail::beget_create_mailbox(&domain, &local, &password).await {
+                    Ok(true) => println!("Mailbox created successfully."),
+                    Ok(false) => println!("Failed to create mailbox (API returned false)."),
+                    Err(e) => println!("Error creating mailbox: {}", e),
+                }
+            }
+            Commands::ListMailboxes { domain } => {
+                println!("Listing mailboxes for domain {}...", &domain);
+                match commands::mail::beget_list_mailboxes(&domain).await {
+                    Ok(list) => {
+                        if list.is_empty() {
+                            println!("No mailboxes found.");
+                        } else {
+                            for m in list { println!("{}", m); }
+                        }
+                    }
+                    Err(e) => println!("Error listing mailboxes: {}", e),
+                }
+            }
+            Commands::DropMailbox { email } => {
+                let (local, domain) = match email.split_once('@') {
+                    Some((l, d)) => (l.to_string(), d.to_string()),
+                    None => bail!("Invalid email format. Use user@domain.com"),
+                };
+                if !commands::mail::allowed_domain(&domain) {
+                    bail!("Domain not allowed. Allowed domains: code-class.ru, uchi.team");
+                }
+                println!("Dropping mailbox {}...", email);
+                match commands::mail::beget_drop_mailbox(&domain, &local).await {
+                    Ok(true) => println!("Mailbox dropped."),
+                    Ok(false) => println!("Failed to drop mailbox (API returned false)."),
+                    Err(e) => println!("Error dropping mailbox: {}", e),
+                }
+            }
+        }
+        return Ok(());
+    }
 
     println!("CWD: {}", std::env::current_dir()?.display());
 
