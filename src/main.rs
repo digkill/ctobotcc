@@ -244,8 +244,8 @@ async fn handle_update(state: AppState, update: TamTamUpdate) {
     }
 
     // === Неизвестная явная команда (/) — не идём в OpenAI ===
-    if text.starts_with('/') {
-        let reply = "Неизвестная команда. Доступно: /mail create|passwd|list, /user, /admin, /courses, /pricing, /schedule, /lessons, /enrollments, /orders, /invoices, /partner_payments, /loan, /feedback";
+    if text.starts_with('$') {
+        let reply = "Неизвестная команда. Доступно: $mail create|passwd|list, $user, $admin, $courses, $pricing, $schedule, $lessons, $enrollments, $orders, $invoices, $partner_payments, $loan, $feedback";
         let _ = save_history_batch(
             &state.pool_rw,
             hist_key,
@@ -660,25 +660,25 @@ enum MailCommand {
 
 fn parse_mail_command(text: &str) -> Option<MailCommand> {
     let t = text.trim();
-    if !t.starts_with("/mail") { return None; }
+    if !t.starts_with("$mail") { return None; }
     let parts: Vec<&str> = t.split_whitespace().collect();
     if parts.len() == 1 { return Some(MailCommand::Help); }
     match parts.get(1).copied().unwrap_or("") {
         "create" => {
-            // /mail create <email> [password]
+            // $mail create <email> [password]
             if let Some(email) = parts.get(2) {
                 let pass = parts.get(3).map(|s| s.to_string());
                 return Some(MailCommand::Create { email: email.to_string(), password: pass });
             }
         }
         "passwd" | "password" => {
-            // /mail passwd <email> <newpass>
+            // $mail passwd <email> <newpass>
             if let (Some(email), Some(pw)) = (parts.get(2), parts.get(3)) {
                 return Some(MailCommand::Passwd { email: email.to_string(), password: pw.to_string() });
             }
         }
         "list" => {
-            // /mail list <domain>
+            // $mail list <domain>
             if let Some(dom) = parts.get(2) {
                 return Some(MailCommand::List { domain: dom.to_string() });
             }
@@ -718,7 +718,7 @@ fn parse_mail_natural(text: &str) -> Option<MailCommand> {
 async fn handle_mail_commands(text: &str) -> Option<String> {
     let cmd = parse_mail_command(text).or_else(|| parse_mail_natural(text))?;
     match cmd {
-        MailCommand::Help => Some("Команды почты:\n/mail create <email> [password]\n/mail passwd <email> <new_password>\n/mail list <domain> — домены: code-class.ru, uchi.team".into()),
+        MailCommand::Help => Some("Команды почты:\n$mail create <email> [password]\n$mail passwd <email> <new_password>\n$mail list <domain> — домены: code-class.ru, uchi.team".into()),
         MailCommand::List { domain } => {
             if !allowed_domain(&domain) {
                 return Some("Разрешены домены: code-class.ru, uchi.team".into());
@@ -838,44 +838,44 @@ fn parse_ro_intent(text: &str) -> Option<RoIntent> {
     let parts: Vec<&str> = t.split_whitespace().collect();
 
     // команды
-    if parts.first().copied() == Some("/user") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$user") && parts.len() >= 2 {
         return Some(RoIntent::UserBy(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/admin") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$admin") && parts.len() >= 2 {
         return Some(RoIntent::AdminBy(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/courses") {
+    if parts.first().copied() == Some("$courses") {
         return Some(RoIntent::CourseFind(parts.get(1).map(|s| s.to_string())));
     }
-    if parts.first().copied() == Some("/pricing") {
+    if parts.first().copied() == Some("$pricing") {
         return Some(RoIntent::PricingFor(parts.get(1).map(|s| s.to_string())));
     }
-    if parts.first().copied() == Some("/schedule") {
+    if parts.first().copied() == Some("$schedule") {
         let course = parts.get(1).map(|s| s.to_string());
         let date = parts.get(2).map(|s| s.to_string());
         return Some(RoIntent::ScheduleFor { course, date });
     }
-    if parts.first().copied() == Some("/lessons") {
+    if parts.first().copied() == Some("$lessons") {
         let course = parts.get(1).map(|s| s.to_string());
         let date = parts.get(2).map(|s| s.to_string());
         return Some(RoIntent::LessonsFor { course, date });
     }
-    if parts.first().copied() == Some("/enrollments") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$enrollments") && parts.len() >= 2 {
         return Some(RoIntent::EnrollmentsFor(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/orders") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$orders") && parts.len() >= 2 {
         return Some(RoIntent::OrdersFor(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/invoices") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$invoices") && parts.len() >= 2 {
         return Some(RoIntent::InvoicesFor(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/partner_payments") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$partner_payments") && parts.len() >= 2 {
         return Some(RoIntent::PartnerPaymentsFor(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/loan") && parts.len() >= 2 {
+    if parts.first().copied() == Some("$loan") && parts.len() >= 2 {
         return Some(RoIntent::LoanAppsFor(parts[1..].join(" ")));
     }
-    if parts.first().copied() == Some("/feedback") {
+    if parts.first().copied() == Some("$feedback") {
         if parts.get(1) == Some(&"lesson") {
             if let Some(id) = parts.get(2).and_then(|s| s.parse::<i64>().ok()) {
                 return Some(RoIntent::LessonFeedbackFor {
@@ -1526,7 +1526,7 @@ async fn query_lesson_feedback(
         }
         return Ok("Пользователь не найден.".into());
     }
-    Ok("Укажи /feedback user <запрос> или /feedback lesson <id>.".into())
+    Ok("Укажи $feedback user <запрос> или $feedback lesson <id>.".into())
 }
 
 /* ===================== TamTam send ========================= */
