@@ -172,6 +172,7 @@ pub async fn beget_list_mailboxes(domain: &str) -> Result<Vec<String>> {
     )
     .await?;
 
+    // Direct array
     if let Some(arr) = v.as_array() {
         let mut out: Vec<String> = Vec::new();
         for it in arr {
@@ -184,11 +185,23 @@ pub async fn beget_list_mailboxes(domain: &str) -> Result<Vec<String>> {
         return Ok(out);
     }
 
-    // Some responses may wrap into {status, answer:[...]}
+    // Wrapped object: { status: "success", result: [...] }
     if let Some(obj) = v.as_object() {
-        if let Some(ans) = obj.get("answer").and_then(|x| x.as_array()) {
+        if let Some(arr) = obj.get("result").and_then(|x| x.as_array()) {
             let mut out: Vec<String> = Vec::new();
-            for it in ans {
+            for it in arr {
+                let mb = it.get("mailbox").and_then(|v| v.as_str()).unwrap_or("");
+                let dm = it.get("domain").and_then(|v| v.as_str()).unwrap_or(domain);
+                if !mb.is_empty() {
+                    out.push(format!("{}@{}", mb, dm));
+                }
+            }
+            return Ok(out);
+        }
+        // Rare fallback: some endpoints could return { answer: [...] }
+        if let Some(arr) = obj.get("answer").and_then(|x| x.as_array()) {
+            let mut out: Vec<String> = Vec::new();
+            for it in arr {
                 let mb = it.get("mailbox").and_then(|v| v.as_str()).unwrap_or("");
                 let dm = it.get("domain").and_then(|v| v.as_str()).unwrap_or(domain);
                 if !mb.is_empty() {
