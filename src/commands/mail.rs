@@ -80,10 +80,14 @@ async fn beget_create_mailbox(domain: &str, mailbox: &str, password: &str) -> Re
         serde_json::json!({"domain": domain, "mailbox": mailbox, "mailbox_password": password}),
     )
     .await?;
-    Ok(match v {
-        Value::Bool(b) => b,
-        _ => false,
-    })
+
+    // The `createMailbox` method can return `true` directly on success,
+    // or an envelope with an `answer` field containing `true`.
+    if let Some(b) = v.as_bool() {
+        return Ok(b);
+    }
+    
+    Ok(false)
 }
 
 async fn beget_change_mailbox_password(
