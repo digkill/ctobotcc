@@ -349,21 +349,12 @@ pub async fn handle_mail_commands(text: &str) -> Option<String> {
             if !allowed_domain(&domain) {
                 return Some("Разрешены домены: code-class.ru, uchi.team".into());
             }
-            match beget_call("getMailboxList", serde_json::json!({"domain": domain})).await {
-                Ok(v) => {
-                    if let Some(arr) = v.as_array() {
-                        if arr.is_empty() {
-                            return Some("Список пуст".into());
-                        }
-                        let mut out = String::new();
-                        for it in arr {
-                            let mb = it.get("mailbox").and_then(|v| v.as_str()).unwrap_or("");
-                            let dm = it.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-                            out.push_str(&format!("{}@{}\n", mb, dm));
-                        }
-                        Some(out)
+            match beget_list_mailboxes(&domain).await {
+                Ok(list) => {
+                    if list.is_empty() {
+                        Some("Список пуст".into())
                     } else {
-                        Some("Не удалось получить список (неверный формат ответа)".into())
+                        Some(list.join("\n"))
                     }
                 }
                 Err(e) => Some(format!("Ошибка Beget: {e}")),
