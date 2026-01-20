@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::env;
 use tracing::info;
-
+use tracing::log::log;
 /* ===================== Beget Mail ============================= */
 
 const BEGET_API_BASE: &str = "https://api.beget.com/api/mail";
@@ -36,6 +36,7 @@ async fn beget_call(method: &str, input: Value) -> Result<Value> {
     let input_s = serde_json::to_string(&input)?;
     // Log request without exposing credentials
     info!("Beget API request: method={} input={}", method, input_s);
+
     let url = format!(
         "{base}/{method}?login={login}&passwd={passwd}&input_format=json&output_format=json&input_data={data}",
         base = BEGET_API_BASE,
@@ -44,6 +45,8 @@ async fn beget_call(method: &str, input: Value) -> Result<Value> {
         passwd = urlencoding::encode(&passwd),
         data = urlencoding::encode(&input_s),
     );
+    info!("Request string {}", url);
+
     let client = reqwest::Client::new();
     let res = client.get(url).send().await?;
     let status = res.status();
